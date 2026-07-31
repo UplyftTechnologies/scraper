@@ -1,0 +1,248 @@
+version: 1
+
+# Empty means keep every brand returned by Nykaa. Add exact brand names here
+# later if you want a smaller, case-insensitive subset.
+brands: []
+
+request:
+  timeout_seconds: 35
+  delay_min_seconds: 2.0
+  delay_max_seconds: 5.0
+  max_requests_per_minute: 12
+  max_retries: 4
+  backoff_base_seconds: 2.0
+  backoff_max_seconds: 45.0
+  soft_block_backoff_seconds: 60.0
+  logs_dir: logs
+
+nykaa:
+  # In Chrome DevTools: Network -> the category XHR/fetch request ->
+  # Copy -> Copy as cURL (bash). Replace the placeholder, preserving the
+  # complete command and every -H header.
+  curl_command: |
+    <PASTE NYKAA cURL HERE>
+  # Alternatively, keep sensitive cookies outside YAML and point to the raw
+  # DevTools cURL text file:
+  curl_file: ""
+
+  site_base_url: https://www.nykaa.com
+
+  # If the category ID is part of the URL path, set a template containing
+  # {category_id}. Otherwise leave this empty and configure category_field.
+  category_url_template: ""
+  category_field: category_id
+  category_location: query       # query or json_body
+
+  page_field: page_no
+  page_location: query           # query or json_body
+  start_page: 1
+  page_limit: 700
+  max_consecutive_page_failures: 3
+  checkpoint_dir: data/checkpoints
+  detail_url: https://www.nykaa.com/app-api/index.php/products/details
+  details:
+    enabled: true
+    # One detail request returns all SKU sizes, their independent prices,
+    # galleries, description, ingredients, usage, ratings and top reviews.
+    include_top_reviews: true
+
+  # The parser tries these paths in order, then uses a defensive recursive
+  # fallback. Dot notation addresses nested JSON objects.
+  products_paths:
+    - response.products
+    - response.data.products
+    - data.products
+    - result.products
+    - products
+
+  categories:
+    # When no category is specified, this parent is used by itself so an
+    # all-categories run does not repeat the overlapping child categories.
+    - id: "8377"
+      name: All Skincare
+      enabled: false
+      covers_all: true
+      # Nykaa repeats the final accessible page when an unfiltered category
+      # exceeds its result window. These non-overlapping price partitions are
+      # all below that ceiling and their results are merged/deduplicated.
+      partitions:
+        - key: price_0_499
+          name: Under ₹500
+          query:
+            price_range_filter: 0-499
+        - key: price_500_999
+          name: ₹500–₹999
+          query:
+            price_range_filter: 500-999
+        - key: price_1000_1999
+          name: ₹1,000–₹1,999
+          query:
+            price_range_filter: 1000-1999
+        - key: price_2000_3999
+          name: ₹2,000–₹3,999
+          query:
+            price_range_filter: 2000-3999
+        - key: price_4000_plus
+          name: ₹4,000 and above
+          query:
+            price_range_filter: 4000-*
+    # Broad skincare categories from Nykaa's public category pages. Keeping
+    # parent categories here avoids duplicate requests to overlapping children
+    # such as Face Wash (under Cleansers) and Face Oils (under Moisturizers).
+    - id: "8435"
+      name: Kits & Combos
+    - id: "8393"
+      name: Moisturizers
+    - id: "8378"
+      name: Cleansers
+    - id: "8397"
+      name: Serums
+    - id: "8399"
+      name: Masks
+    - id: "8428"
+      name: Sun Care
+    - {id: "30710", name: "Korean Beauty"}
+    - {id: "8417", name: "Body Care"}
+    - id: "8392"
+      name: Shop Toners & Mists
+    - id: "8408"
+      name: Lip Care
+    - id: "8402"
+      name: Eye Care
+    - {id: "52743", name: "Dermocosmetic Brands"}
+    - {id: "8431", name: "Hands & Feet"}
+    - {id: "25758", name: "Skin Tools"}
+    - {id: "25754", name: "Specialised Skincare"}
+    - {id: "8412", name: "Neck Creams"}
+    - {id: "24046", name: "Skin Supplements"}
+
+tira:
+  # The catalogue endpoint is public and normally needs no captured cookies.
+  # A copied storefront cURL can still be supplied here if Tira changes that.
+  curl_command: ""
+  curl_file: ""
+  site_base_url: https://www.tirabeauty.com
+  listing_url_template: https://fp-cdn.tirabeauty.com/ext/plpoffers/application/api/v1.0/collections/{collection}/items
+  detail_url_template: https://api.tirabeauty.com/service/application/catalog/v1.0/products/{slug}/sizes/
+
+  # Public storefront application credentials embedded in Tira's web app.
+  # Refresh these from the page bootstrap if the size endpoint returns 401.
+  application_id: "62d53777f5ad942d3e505f77"
+  application_token: "ikdiQv6tj"
+  page_size: 50
+  page_limit: 200
+  checkpoint_dir: data/checkpoints
+  details:
+    enabled: true
+    include_top_reviews: true
+
+  categories:
+    - id: skin
+      name: All Skin
+      enabled: false
+      covers_all: true
+    - id: skin-kits-and-combos
+      name: Kits & Combos
+    - id: skin-moisturizer
+      name: Moisturizers
+    - id: skin-cleansers-and-exfoliators
+      name: Cleansers
+    - id: skin-serums-and-essences
+      name: Serums
+    - id: skin-masks
+      name: Masks
+    - id: skin-sun-care
+      name: Sun Care
+    - {id: korean-beauty, name: "Korean Beauty"}
+    - {id: bath-and-body-body-care, name: "Body Care"}
+    - {id: skin-toners-and-mists-toner, name: "Shop Toners & Mists"}
+    - id: skin-lip-care
+      name: Lip Care
+    - id: skin-eye-care
+      name: Eye Care
+    - {id: dermocosmetic, name: "Dermocosmetic Brands"}
+    - {id: bath-and-body-hands-and-feet, name: "Hands & Feet"}
+    - {id: tools--appliances-face-tools, name: "Skin Tools"}
+    # Tira has no dedicated public collections for the next three labels.
+    # Use a broader live collection, then retain only matching public records.
+    - id: specialised-skincare
+      collection: skin-101-ip
+      name: Specialised Skincare
+      include_keywords:
+        - acne
+        - blemish
+        - pimple
+        - spot
+        - peel
+        - scar
+        - pore
+    - id: neck-creams
+      collection: bath-and-body-body-care
+      name: Neck Creams
+      include_keywords: [neck, decollete, décolleté]
+    - id: skin-supplements
+      collection: wellness
+      name: Skin Supplements
+      include_keywords:
+        - skin
+        - beauty
+        - collagen
+        - glutathione
+        - hyaluronic
+        - biotin
+
+amazon:
+  headless: true
+  browser_channel: chrome
+  search_page_limit: 2
+  max_products_per_category: 40
+  max_variants_per_product: 12
+  navigation_timeout_ms: 45000
+  search_result_timeout_ms: 12000
+  challenge_wait_ms: 10000
+  warmup_enabled: true
+  warmup_wait_ms: 8000
+  delay_min_seconds: 2.0
+  delay_max_seconds: 5.0
+  checkpoint_dir: data/checkpoints
+  max_retries: 2
+  products: []
+  categories:
+    - {name: "Kits & Combos", query: "beauty skincare kits combos"}
+    - {name: "Moisturizers", query: "face moisturizer skincare"}
+    - {name: "Cleansers", query: "face cleanser skincare"}
+    - {name: "Serums", query: "face serum skincare"}
+    - {name: "Masks", query: "face masks skincare"}
+    - {name: "Sun Care", query: "sunscreen skincare"}
+    - {name: "Korean Beauty", query: "Korean skincare"}
+    - {name: "Body Care", query: "body care skincare"}
+    - {name: "Shop Toners & Mists", query: "face toner mist skincare"}
+    - {name: "Lip Care", query: "lip care skincare"}
+    - {name: "Eye Care", query: "eye care skincare"}
+    - {name: "Dermocosmetic Brands", query: "dermatologist recommended skincare"}
+    - {name: "Hands & Feet", query: "hand foot care cream"}
+    - {name: "Skin Tools", query: "skin care tools face massager"}
+    - {name: "Specialised Skincare", query: "acne spot corrector facial peel"}
+    - {name: "Neck Creams", query: "neck cream skincare"}
+    - {name: "Skin Supplements", query: "skin supplements collagen glutathione"}
+
+output:
+  excel_path: data/pricing.xlsx
+  combined_csv_path: data/pricing_combined.csv
+
+database:
+  # Credentials stay in .env. This flag prevents library/tests from writing
+  # unless the production application explicitly opts in.
+  enabled: true
+
+automation:
+  # Nightly jobs always sweep listings, then request full details only for
+  # new, changed, incomplete, or periodically stale products.
+  detail_refresh_days: 30
+  max_detail_requests_per_run: 1000
+  # Refuse to age missing products if a run suddenly returns less than half
+  # the current retailer row count (API/schema/block safety gate).
+  minimum_catalogue_ratio: 0.5
+  # A product must be absent from this many complete nightly sweeps before it
+  # becomes inactive. Partial/blocked runs never age missing products.
+  missing_runs_before_inactive: 3

@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+logs/
+data/
+private/
+legacy/
+.pytest_cache/
+.ruff_cache/
+config.local.yaml
+.env

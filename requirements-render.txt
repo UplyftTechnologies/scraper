@@ -1,0 +1,6 @@
+requests
+PyYAML
+python-dotenv
+streamlit>=1.57
+pandas
+openpyxl

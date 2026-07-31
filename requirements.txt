@@ -1,0 +1,7 @@
+requests
+PyYAML
+openpyxl
+python-dotenv
+streamlit>=1.57
+playwright>=1.61
+playwright-stealth>=2.0

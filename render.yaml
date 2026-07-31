@@ -1,0 +1,57 @@
+services:
+  - type: web
+    name: beauty-catalogue
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python -m streamlit run product_viewer_app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
+    healthCheckPath: /
+    envVars:
+      - key: HOSTED_DASHBOARD
+        value: "true"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: SUPABASE_RUNS_TABLE
+        value: retailer_scrape_runs
+
+  - type: cron
+    name: beauty-nykaa-nightly
+    runtime: docker
+    plan: starter
+    schedule: "0 19 * * *"
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python -m pricing_scraper.scheduler --site nykaa --config config.yaml
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: DATABASE_SYNC_REQUIRED
+        value: "true"
+      - key: SUPABASE_RUNS_TABLE
+        value: retailer_scrape_runs
+      - key: NYKAA_CURL_COMMAND
+        sync: false
+
+  - type: cron
+    name: beauty-tira-nightly
+    runtime: docker
+    plan: starter
+    schedule: "0 20 * * *"
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python -m pricing_scraper.scheduler --site tira --config config.yaml
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: DATABASE_SYNC_REQUIRED
+        value: "true"
+      - key: SUPABASE_RUNS_TABLE
+        value: retailer_scrape_runs
+      - key: TIRA_APPLICATION_ID
+        sync: false
+      - key: TIRA_APPLICATION_TOKEN
+        sync: false
