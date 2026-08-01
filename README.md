@@ -41,7 +41,11 @@ pricing_scraper/
   dashboard_service.py
   exporter.py
   models.py
-streamlit_app.py
+app_pages/
+  scraper.py         # "Scraper" tab
+  product_view.py    # "Product view" tab
+streamlit_app.py     # entry point: both tabs
+product_viewer_app.py # entry point: product view only (hosted deployment)
 dashboard.py
 config.yaml
 config.local.yaml    # ignored private Nykaa override
@@ -163,7 +167,11 @@ saved for the other retailers.
 
 ## Read-only product viewer
 
-Run the independent viewer in a second terminal while scraping continues:
+The dashboard has two top tabs — **Scraper** and **Product view** — so the
+viewer is available in the same app on port `8501` without a second process.
+
+Run the independent viewer in a second terminal when you want it on its own
+port while scraping continues:
 
 ```powershell
 cd D:\scraper
@@ -171,8 +179,8 @@ cd D:\scraper
 python product_viewer.py
 ```
 
-Open <http://127.0.0.1:8502>. The scraper remains on port `8501`; the viewer
-uses port `8502` and never writes to checkpoints, exports, or the database.
+Open <http://127.0.0.1:8502>. That entry point shows only the product view and
+never writes to checkpoints, exports, or the database.
 
 The default **Live checkpoints** source shows products before the current run
 reaches its final Excel/database synchronization. It refreshes every 15
