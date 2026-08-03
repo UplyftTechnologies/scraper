@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import math
-import os
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import streamlit as st
 
+from app_auth import hosted_deployment
 from pricing_scraper.catalog_reader import (
     CatalogSnapshot,
     checkpoint_signature,
@@ -892,12 +892,7 @@ st.session_state.setdefault("selected_product_key", "")
 
 with st.sidebar:
     st.header("Catalogue settings")
-    hosted = os.getenv("HOSTED_DASHBOARD", "").strip().casefold() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    hosted = hosted_deployment()
     source = st.selectbox(
         "Data source",
         ("Live checkpoints", "Supabase database", "Latest exported CSV"),

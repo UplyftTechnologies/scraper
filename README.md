@@ -132,12 +132,20 @@ below are never applied and the two cron jobs are never created. Enter these
 server-side values when requested:
 
 ```text
+APP_PASSWORD            # Web service only: password gate for the public URL
 SUPABASE_URL
 SUPABASE_SECRET_KEY
 NYKAA_CURL_COMMAND      # Nykaa job and the hosted Scraper tab
 TIRA_APPLICATION_ID     # Tira job and the hosted Scraper tab
 TIRA_APPLICATION_TOKEN  # Tira job and the hosted Scraper tab
 ```
+
+The hosted Scraper tab can start runs that write to Supabase, so `app_auth.py`
+gates both entry points behind `APP_PASSWORD` before any page renders. A
+deployment with `HOSTED_DASHBOARD=true` and no `APP_PASSWORD` refuses to serve
+rather than publishing the dashboard. Local runs leave the variable unset and
+are never prompted. The session unlocks per browser tab, so a reload asks
+again.
 
 The hosted Scraper tab offers Nykaa and Tira only. `requirements-render.txt`
 omits Playwright, so `amazon_dependencies_available()` reports `False` and the

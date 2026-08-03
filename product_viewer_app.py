@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import streamlit as st
 
+from app_auth import require_password
+
 st.set_page_config(
     page_title="Beauty catalogue",
     page_icon=":material/shopping_bag:",
     layout="wide",
 )
+
+require_password()
 
 page = st.navigation(
     [

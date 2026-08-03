@@ -11,6 +11,10 @@ services:
     envVars:
       - key: HOSTED_DASHBOARD
         value: "true"
+      # The public URL exposes the Scraper tab, so the app refuses to serve
+      # until this is set. Only the web service needs it.
+      - key: APP_PASSWORD
+        sync: false
       - key: STREAMLIT_SERVER_ADDRESS
         value: 0.0.0.0
       - key: SUPABASE_URL
