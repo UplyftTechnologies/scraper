@@ -12,4 +12,8 @@ RUN python -m pip install --upgrade pip \
 
 COPY . .
 
-CMD ["python", "-m", "streamlit", "run", "product_viewer_app.py", "--server.address=0.0.0.0", "--server.headless=true"]
+# Shell form so ${PORT} supplied by Render is expanded at start-up.
+CMD python -m streamlit run streamlit_app.py \
+    --server.address=0.0.0.0 \
+    --server.port=${PORT:-8501} \
+    --server.headless=true

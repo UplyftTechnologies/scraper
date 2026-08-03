@@ -3,30 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Sequence
 
 from pricing_scraper.automation import run_incremental_site
 from pricing_scraper.clients.base import ConfigurationError, build_logger
-from pricing_scraper.config import default_config_path, load_config
+from pricing_scraper.config import (
+    apply_environment_overrides,
+    default_config_path,
+    load_config,
+)
 from pricing_scraper.database import DatabaseConfigurationError, SupabaseCatalogStore
-
-
-def _apply_environment_overrides(config: dict[str, Any]) -> None:
-    nykaa_command = os.getenv("NYKAA_CURL_COMMAND", "").strip()
-    nykaa_file = os.getenv("NYKAA_CURL_FILE", "").strip()
-    if nykaa_command:
-        config["nykaa"]["curl_command"] = nykaa_command
-        config["nykaa"]["curl_file"] = ""
-    elif nykaa_file:
-        config["nykaa"]["curl_file"] = nykaa_file
-    tira_id = os.getenv("TIRA_APPLICATION_ID", "").strip()
-    tira_token = os.getenv("TIRA_APPLICATION_TOKEN", "").strip()
-    if tira_id:
-        config["tira"]["application_id"] = tira_id
-    if tira_token:
-        config["tira"]["application_token"] = tira_token
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,7 +40,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     try:
         config = load_config(args.config)
-        _apply_environment_overrides(config)
+        apply_environment_overrides(config)
         store, _required = SupabaseCatalogStore.from_environment()
         if store is None:
             raise DatabaseConfigurationError(

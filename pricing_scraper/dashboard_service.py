@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.util
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from pricing_scraper.checkpoint import CheckpointStore, DetailCheckpointStore
-from pricing_scraper.clients.amazon import AmazonClient
-from pricing_scraper.clients.base import RequestFailed
+from pricing_scraper.clients.base import ConfigurationError, RequestFailed
 from pricing_scraper.clients.nykaa import NykaaClient
 from pricing_scraper.clients.tira import TiraClient
 from pricing_scraper.exporter import (
@@ -23,6 +23,29 @@ from pricing_scraper.exporter import (
 from pricing_scraper.models import Product
 
 ProgressCallback = Callable[[str, int, int, str], None]
+
+AMAZON_UNAVAILABLE_MESSAGE = (
+    "Amazon collection needs the Playwright browser dependencies, which the "
+    "hosted deployment does not install. Run Amazon locally with "
+    "`pip install -r requirements.txt` and `playwright install chromium`."
+)
+
+
+def amazon_dependencies_available() -> bool:
+    """Report whether the Playwright-backed Amazon client can be imported."""
+    try:
+        return importlib.util.find_spec("playwright") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _load_amazon_client() -> type:
+    """Import the Amazon client only when an Amazon run actually starts."""
+    try:
+        from pricing_scraper.clients.amazon import AmazonClient
+    except ImportError as exc:
+        raise ConfigurationError(AMAZON_UNAVAILABLE_MESSAGE) from exc
+    return AmazonClient
 
 
 def _database_sync_enabled(config: dict[str, Any]) -> bool:
@@ -836,6 +859,7 @@ def collect_amazon(
 ) -> CollectionResult:
     """Collect Amazon search results and public product-page details."""
     del enrich_details
+    amazon_client_class = _load_amazon_client()
     run_config = copy.deepcopy(config)
     run_config["amazon"]["search_page_limit"] = max(1, int(page_limit))
     requested_categories = list(categories)
@@ -863,7 +887,7 @@ def collect_amazon(
     processed_before = detail_store.load_processed_ids()
     resumed = detail_store.load_products()
 
-    with AmazonClient(
+    with amazon_client_class(
         site_config=run_config["amazon"],
         request_config=run_config["request"],
         brands=run_config.get("brands", ()),

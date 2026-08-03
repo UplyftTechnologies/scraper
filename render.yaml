@@ -4,17 +4,29 @@ services:
     runtime: docker
     plan: starter
     dockerfilePath: ./Dockerfile
-    dockerCommand: python -m streamlit run product_viewer_app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
+    # No dockerCommand: the Dockerfile CMD runs through a shell so ${PORT}
+    # expands. A dockerCommand here would not expand it and the port bind
+    # would fail.
     healthCheckPath: /
     envVars:
       - key: HOSTED_DASHBOARD
         value: "true"
+      - key: STREAMLIT_SERVER_ADDRESS
+        value: 0.0.0.0
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SECRET_KEY
         sync: false
       - key: SUPABASE_RUNS_TABLE
         value: retailer_scrape_runs
+      # Needed by the Scraper tab. Amazon is not hosted: the image has no
+      # Playwright browsers, so the tab offers Nykaa and Tira only.
+      - key: NYKAA_CURL_COMMAND
+        sync: false
+      - key: TIRA_APPLICATION_ID
+        sync: false
+      - key: TIRA_APPLICATION_TOKEN
+        sync: false
 
   - type: cron
     name: beauty-nykaa-nightly

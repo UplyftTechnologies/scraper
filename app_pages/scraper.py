@@ -9,8 +9,14 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from pricing_scraper.config import default_config_path, load_config
+from pricing_scraper.config import (
+    apply_environment_overrides,
+    default_config_path,
+    load_config,
+)
 from pricing_scraper.dashboard_service import (
+    AMAZON_UNAVAILABLE_MESSAGE,
+    amazon_dependencies_available,
     collect_amazon,
     collect_nykaa,
     collect_tira,
@@ -140,18 +146,23 @@ try:
 except Exception as exc:
     st.error(f"Configuration could not be loaded: {exc}")
     st.stop()
+apply_environment_overrides(config)
+
+amazon_available = amazon_dependencies_available()
 
 with st.sidebar:
     st.header("Collection settings")
     st.caption(f"Config: `{config_path}`")
     retailer = st.selectbox(
         "Retailer",
-        options=("Nykaa", "Tira", "Amazon"),
+        options=("Nykaa", "Tira", "Amazon") if amazon_available else ("Nykaa", "Tira"),
         help=(
             "Each run refreshes one retailer while preserving the other "
             "site's rows."
         ),
     )
+    if not amazon_available:
+        st.caption(AMAZON_UNAVAILABLE_MESSAGE)
     site_key = retailer.casefold()
     category_records = [
         item

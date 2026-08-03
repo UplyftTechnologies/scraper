@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -63,3 +64,20 @@ def load_config(path: Path, _seen: set[Path] | None = None) -> dict[str, Any]:
                 curl_path = resolved.parent / curl_path
             payload[site]["curl_file"] = str(curl_path.resolve())
     return payload
+
+
+def apply_environment_overrides(config: dict[str, Any]) -> None:
+    """Let hosted secrets replace the credentials committed in the YAML."""
+    nykaa_command = os.getenv("NYKAA_CURL_COMMAND", "").strip()
+    nykaa_file = os.getenv("NYKAA_CURL_FILE", "").strip()
+    if nykaa_command:
+        config["nykaa"]["curl_command"] = nykaa_command
+        config["nykaa"]["curl_file"] = ""
+    elif nykaa_file:
+        config["nykaa"]["curl_file"] = nykaa_file
+    tira_id = os.getenv("TIRA_APPLICATION_ID", "").strip()
+    tira_token = os.getenv("TIRA_APPLICATION_TOKEN", "").strip()
+    if tira_id:
+        config["tira"]["application_id"] = tira_id
+    if tira_token:
+        config["tira"]["application_token"] = tira_token

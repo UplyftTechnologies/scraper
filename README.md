@@ -122,24 +122,32 @@ hosted product viewer displays the latest result for both retailers.
 
 `render.yaml` creates three services:
 
-- `beauty-catalogue`: read-only Streamlit/Supabase product viewer
+- `beauty-catalogue`: the `streamlit_app.py` Scraper and Product view tabs
 - `beauty-nykaa-nightly`: daily at 19:00 UTC (00:30 IST)
 - `beauty-tira-nightly`: daily at 20:00 UTC (01:30 IST)
 
-Deploy the repository as a Render Blueprint and enter these server-side
-environment values when requested:
+Deploy the repository as a Render **Blueprint**, not as a single Web Service.
+Creating the service by hand ignores `render.yaml`, so the environment values
+below are never applied and the two cron jobs are never created. Enter these
+server-side values when requested:
 
 ```text
 SUPABASE_URL
 SUPABASE_SECRET_KEY
-NYKAA_CURL_COMMAND       # Nykaa job: complete Copy as cURL (bash)
-TIRA_APPLICATION_ID     # Tira job only
-TIRA_APPLICATION_TOKEN  # Tira job only
+NYKAA_CURL_COMMAND      # Nykaa job and the hosted Scraper tab
+TIRA_APPLICATION_ID     # Tira job and the hosted Scraper tab
+TIRA_APPLICATION_TOKEN  # Tira job and the hosted Scraper tab
 ```
 
-Render keeps separate logs for each cron service. Database run history remains
-durable even though cron filesystems are temporary. Amazon is intentionally
-not present in `render.yaml` and continues to run manually.
+The hosted Scraper tab offers Nykaa and Tira only. `requirements-render.txt`
+omits Playwright, so `amazon_dependencies_available()` reports `False` and the
+retailer list drops Amazon rather than offering a run that cannot start.
+Amazon stays local, and is intentionally absent from `render.yaml` too.
+
+Render web and cron filesystems are temporary, so anything a hosted run writes
+to `data/` or `logs/` disappears on the next deploy or restart. Only the
+Supabase rows survive, which is why `HOSTED_DASHBOARD=true` makes the Product
+view read the database instead of local checkpoints.
 
 Test the production commands locally before deploying:
 
