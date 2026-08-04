@@ -1,6 +1,5 @@
-[server]
-address = "127.0.0.1"
-port = 8501
-
+# Address and port are set per environment instead of here: locally Streamlit
+# uses its own defaults (localhost:8501), and on Render the Dockerfile passes
+# 0.0.0.0 with the ${PORT} the platform assigns.
 [browser]
 gatherUsageStats = false

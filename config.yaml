@@ -1,7 +1,7 @@
 version: 1
 
-# Empty means keep every brand returned by Nykaa. Add exact brand names here
-# later if you want a smaller, case-insensitive subset.
+# Empty means keep every brand the retailer returns. SCRAPE_BRANDS in .env
+# replaces this list when it is set; matching ignores case and punctuation.
 brands: []
 
 request:

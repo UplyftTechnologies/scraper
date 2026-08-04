@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import unquote_plus, urlencode, urljoin, urlparse, urlunparse
 
-from pricing_scraper.models import Product
+from pricing_scraper.models import Product, brand_key, normalize_gtin
 
 from .base import (
     BaseJsonClient,
@@ -136,6 +136,52 @@ def _html_content(value: Any) -> tuple[str, list[str]]:
     return "\n".join(lines), parser.image_urls
 
 
+_KEY_INGREDIENT_HEADING = re.compile(r"(?i)key\s+ingredients?\s*:?")
+_SECTION_END = re.compile(
+    r"(?i)(full\s+ingredient|ingredient\s+list|other\s+ingredients|"
+    r"all\s+ingredients)"
+)
+
+
+def _key_ingredients(html: Any) -> list[str]:
+    """Pull the named key ingredients out of Nykaa's ingredients HTML.
+
+    Nykaa writes this section two ways: a bulleted list whose bold label names
+    the ingredient, or one paragraph of ``Name:description.`` pairs. Products
+    that publish only the full INCI list return nothing.
+    """
+    markup = str(html or "")
+    heading = _KEY_INGREDIENT_HEADING.search(markup)
+    if not heading:
+        return []
+    body = markup[heading.end():]
+    end = _SECTION_END.search(body)
+    if end:
+        body = body[: end.start()]
+
+    names: list[str] = []
+    items = re.findall(r"(?is)<li\b[^>]*>(.*?)</li>", body)
+    for item in items:
+        label = re.search(r"(?is)<b\b[^>]*>(.*?)</b>", item)
+        # Without a bold label the whole bullet is the name up to its colon.
+        text = _text(unescape(re.sub(r"<[^>]+>", " ", label.group(1) if label else item)))
+        names.append(text.split(":")[0])
+    if not items:
+        # Inline form: "Niacinamide:Brightens skin.Panthenol:Moisturizes."
+        plain = _text(unescape(re.sub(r"<[^>]+>", " ", body)))
+        for segment in plain.split(":")[:-1]:
+            # The name is the tail of the previous description sentence.
+            candidate = re.split(r"(?<=[.!])\s*", segment)[-1]
+            names.append(candidate)
+
+    unique: dict[str, str] = {}
+    for name in names:
+        cleaned = _text(name).strip(" .,;-–—&")
+        if 1 < len(cleaned) <= 80:
+            unique.setdefault(cleaned.casefold(), cleaned)
+    return list(unique.values())
+
+
 @dataclass(frozen=True, slots=True)
 class CategoryScrapeResult:
     """Outcome of a resumable category pagination run."""
@@ -220,7 +266,7 @@ class NykaaClient(BaseJsonClient):
             if isinstance(category, Mapping)
         ]
         self.brand_filter = {
-            _text(brand).casefold() for brand in brands if _text(brand)
+            brand_key(brand) for brand in brands if brand_key(brand)
         }
         self.page_failures = 0
         self.product_failures = 0
@@ -587,6 +633,13 @@ class NykaaClient(BaseJsonClient):
             )
         return breakdown
 
+    @staticmethod
+    def _gtin(record: Mapping[str, Any]) -> str:
+        """Read the EAN/UPC barcode Nykaa publishes for a product or option."""
+        return normalize_gtin(
+            _first(record, ("gtin", "ean", "upc", "barcode"))
+        )
+
     def _parse_detail_response(
         self,
         response: Mapping[str, Any],
@@ -598,6 +651,7 @@ class NykaaClient(BaseJsonClient):
         ingredients, ingredient_images = _html_content(
             response.get("ingredients")
         )
+        key_ingredients = _key_ingredients(response.get("ingredients"))
         how_to_use, usage_images = _html_content(response.get("use"))
         content_images = self._media_urls(
             description_images,
@@ -706,6 +760,13 @@ class NykaaClient(BaseJsonClient):
             in_stock = self._stock(option)
             if in_stock is None:
                 in_stock = self._stock(response)
+            # Each size carries its own barcode, so a response-level GTIN is
+            # only reused for the SKU it actually describes.
+            gtin = self._gtin(option)
+            if not gtin and product_id == _text(response.get("id")):
+                gtin = self._gtin(response)
+            if not gtin and product_id == fallback.product_id:
+                gtin = fallback.gtin
 
             products.append(
                 Product(
@@ -717,6 +778,7 @@ class NykaaClient(BaseJsonClient):
                         or parent_id
                     ),
                     sku=_text(option.get("sku") or response.get("sku")),
+                    gtin=gtin,
                     brand=brand,
                     product_name=name,
                     categories=list(fallback.categories),
@@ -756,6 +818,7 @@ class NykaaClient(BaseJsonClient):
                     description=description,
                     description_html=description_html,
                     ingredients=ingredients,
+                    key_ingredients=list(key_ingredients),
                     how_to_use=how_to_use,
                     key_features=list(fallback.key_features),
                     special_features=list(fallback.special_features),
@@ -829,7 +892,7 @@ class NykaaClient(BaseJsonClient):
             raise ValueError("record has no product ID or product name")
 
         brand = self._brand(record)
-        if self.brand_filter and brand.casefold() not in self.brand_filter:
+        if self.brand_filter and brand_key(brand) not in self.brand_filter:
             return None
 
         mrp = _number(
@@ -966,6 +1029,7 @@ class NykaaClient(BaseJsonClient):
                     ("sku", "vendor_sku", "psku"),
                 )
             ),
+            gtin=self._gtin(record),
             brand=brand,
             product_name=name,
             categories=(

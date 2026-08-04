@@ -9,7 +9,11 @@ from typing import Any, Sequence
 
 from pricing_scraper.clients.base import ConfigurationError
 from pricing_scraper.clients.nykaa import NykaaClient
-from pricing_scraper.config import default_config_path, load_config
+from pricing_scraper.config import (
+    apply_environment_overrides,
+    default_config_path,
+    load_config,
+)
 from pricing_scraper.dashboard_service import collect_amazon, collect_tira
 from pricing_scraper.exporter import ExportResult, export_products
 
@@ -230,6 +234,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
+        apply_environment_overrides(config)
         if args.site == "nykaa":
             return run_nykaa(args, config)
         if args.site == "tira":

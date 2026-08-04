@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import requests
-from dotenv import dotenv_values
 
+from pricing_scraper.config import environment_values
 from pricing_scraper.models import Product
 
 TABLE_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -38,20 +36,7 @@ class DatabaseSyncResult:
 
 
 def _environment() -> dict[str, str]:
-    env_path = Path(__file__).resolve().parents[1] / ".env"
-    file_values = {
-        str(key): str(value)
-        for key, value in dotenv_values(env_path).items()
-        if value is not None
-    }
-    return {
-        **file_values,
-        **{
-            key: value
-            for key, value in os.environ.items()
-            if value is not None
-        },
-    }
+    return environment_values()
 
 
 def _boolean(value: Any, default: bool) -> bool:

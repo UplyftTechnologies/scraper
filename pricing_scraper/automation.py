@@ -35,10 +35,12 @@ SOURCE_FIELDS = (
     "image_url",
 )
 RICH_FIELDS = (
+    "gtin",
     "image_urls",
     "description",
     "description_html",
     "ingredients",
+    "key_ingredients",
     "how_to_use",
     "key_features",
     "special_features",
@@ -359,6 +361,13 @@ def run_incremental_site(
             brands=config.get("brands", ()),
         ) as client:
             listing, complete, stop_reasons = _collect_listing(client)
+            if client.brand_filter:
+                # A brand-filtered sweep never sees the rest of the catalogue,
+                # so it must not age other brands out of the database.
+                complete = False
+                stop_reasons.append(
+                    f"brand_filter:{len(client.brand_filter)} brand(s)"
+                )
             if not listing:
                 raise RuntimeError(
                     f"{site.title()} returned zero products; refusing to update "

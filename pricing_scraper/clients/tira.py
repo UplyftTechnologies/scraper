@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import quote, urlencode, urljoin, urlparse
 
-from pricing_scraper.models import Product
+from pricing_scraper.models import Product, brand_key, normalize_gtin
 
 from .base import (
     BaseJsonClient,
@@ -278,7 +278,7 @@ class TiraClient(BaseJsonClient):
             and category.get("name")
         ]
         self.brand_filter = {
-            _text(brand).casefold() for brand in brands if _text(brand)
+            brand_key(brand) for brand in brands if brand_key(brand)
         }
         detail_config = _mapping(site_config.get("details"))
         self.include_top_reviews = bool(
@@ -467,6 +467,28 @@ class TiraClient(BaseJsonClient):
         return mrp, sale, discount
 
     @staticmethod
+    def _gtin(record: Mapping[str, Any]) -> str:
+        """Pick a barcode out of Tira's identifier lists when one is present.
+
+        Tira normally publishes only its own numeric item code, which fails
+        GTIN validation and is dropped rather than exported as a barcode.
+        """
+        candidates: list[Any] = [
+            record.get(key)
+            for key in ("ean", "gtin", "upc", "barcode")
+        ]
+        for key in ("seller_identifiers", "all_identifiers", "identifiers"):
+            for value in _list(record.get(key)):
+                candidates.append(
+                    value.get("value") if isinstance(value, Mapping) else value
+                )
+        for candidate in candidates:
+            gtin = normalize_gtin(candidate)
+            if gtin:
+                return gtin
+        return ""
+
+    @staticmethod
     def _variant_records(item: Mapping[str, Any]) -> list[Mapping[str, Any]]:
         found: dict[str, Mapping[str, Any]] = {}
         root_uid = _text(item.get("uid"))
@@ -506,7 +528,7 @@ class TiraClient(BaseJsonClient):
         ) or _text(
             attributes.get("brand-name") or attributes.get("brand_name")
         )
-        if self.brand_filter and brand.casefold() not in self.brand_filter:
+        if self.brand_filter and brand_key(brand) not in self.brand_filter:
             return []
         description_html = str(
             attributes.get("description")
@@ -543,11 +565,9 @@ class TiraClient(BaseJsonClient):
         }
         key_features = _text_list(attributes.get("benefits"))
         special_features = _text_list(attributes.get("preference"))
-        special_features.extend(
-            value
-            for value in _text_list(attributes.get("super-ingredients"))
-            if value not in special_features
-        )
+        # Tira's super-ingredients are ingredient names, not claims, so they
+        # get their own column instead of being mixed into special features.
+        key_ingredients = _text_list(attributes.get("super-ingredients"))
         root_uid = _text(item.get("uid"))
         variants = self._variant_records(item)
         variant_uids = sorted(
@@ -587,6 +607,11 @@ class TiraClient(BaseJsonClient):
                 root_price if is_root else (None, None, None)
             )
             sku = _text(root_skus[0]) if is_root and root_skus else ""
+            gtin = self._gtin(variant)
+            if not gtin and is_root:
+                # A parent barcode only describes the parent's own SKU, so it
+                # is never copied onto the other size variants.
+                gtin = self._gtin(root_identifiers) or self._gtin(item)
             available = variant.get("is_available")
             if available is None:
                 available = item.get("sellable")
@@ -596,6 +621,7 @@ class TiraClient(BaseJsonClient):
                     product_id=product_id,
                     parent_product_id=parent_id,
                     sku=sku,
+                    gtin=gtin,
                     brand=brand,
                     product_name=name,
                     categories=(
@@ -621,6 +647,7 @@ class TiraClient(BaseJsonClient):
                     description=description,
                     description_html=description_html,
                     ingredients=ingredients,
+                    key_ingredients=list(key_ingredients),
                     how_to_use=how_to_use,
                     key_features=key_features,
                     special_features=special_features,
@@ -850,6 +877,7 @@ class TiraClient(BaseJsonClient):
         return replace(
             product,
             sku=_text(identifiers[0]) if identifiers else product.sku,
+            gtin=self._gtin(selected) or product.gtin,
             variant=product.variant
             or _text(selected.get("display") or selected.get("value")),
             mrp=mrp,

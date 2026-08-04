@@ -11,20 +11,21 @@ services:
     envVars:
       - key: HOSTED_DASHBOARD
         value: "true"
-      # The public URL exposes the Scraper tab, so the app refuses to serve
+      # The public URL exposes the dashboard, so the app refuses to serve
       # until this is set. Only the web service needs it.
       - key: APP_PASSWORD
         sync: false
-      - key: STREAMLIT_SERVER_ADDRESS
-        value: 0.0.0.0
+      # Comma-separated brand allowlist. Blank keeps every brand.
+      - key: SCRAPE_BRANDS
+        value: ""
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SECRET_KEY
         sync: false
       - key: SUPABASE_RUNS_TABLE
         value: retailer_scrape_runs
-      # Needed by the Scraper tab. Amazon is not hosted: the image has no
-      # Playwright browsers, so the tab offers Nykaa and Tira only.
+      # Needed by the dashboard. Amazon is not hosted: the image has no
+      # Playwright browsers, so it offers Nykaa and Tira only.
       - key: NYKAA_CURL_COMMAND
         sync: false
       - key: TIRA_APPLICATION_ID
@@ -48,6 +49,8 @@ services:
         value: "true"
       - key: SUPABASE_RUNS_TABLE
         value: retailer_scrape_runs
+      - key: SCRAPE_BRANDS
+        value: ""
       - key: NYKAA_CURL_COMMAND
         sync: false
 
@@ -67,6 +70,8 @@ services:
         value: "true"
       - key: SUPABASE_RUNS_TABLE
         value: retailer_scrape_runs
+      - key: SCRAPE_BRANDS
+        value: ""
       - key: TIRA_APPLICATION_ID
         sync: false
       - key: TIRA_APPLICATION_TOKEN

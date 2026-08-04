@@ -2,8 +2,46 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
+
+GTIN_LENGTHS = (8, 12, 13, 14)
+
+
+def brand_key(value: Any) -> str:
+    """Fold a brand name into a comparable key for the configured filter.
+
+    Retailers punctuate and capitalize brands differently (``d'Alba`` versus
+    ``dAlba``, ``e.l.f.`` versus ``ELF``), so a filter entry copied from one
+    storefront still matches the same brand on another.
+    """
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def normalize_gtin(value: Any) -> str:
+    """Return a retailer barcode as a bare GTIN-8/12/13/14, or an empty string.
+
+    Retailers publish EAN/UPC values under several names and occasionally with
+    separators or an internal item code in the same field. Only digit strings
+    of a valid GTIN length whose GS1 mod-10 check digit matches are kept, so a
+    seller SKU that merely looks numeric is never exported as a barcode.
+    """
+    digits = "".join(
+        character
+        for character in str(value or "")
+        if character.isdigit()
+    )
+    if len(digits) not in GTIN_LENGTHS:
+        return ""
+    body = [int(character) for character in digits[:-1]]
+    total = sum(
+        digit * weight
+        for digit, weight in zip(reversed(body), (3, 1) * len(body))
+    )
+    if (10 - total % 10) % 10 != int(digits[-1]):
+        return ""
+    return digits
 
 
 @dataclass(slots=True)
@@ -18,6 +56,7 @@ class Product:
     source_categories: list[str] = field(default_factory=list)
     parent_product_id: str = ""
     sku: str = ""
+    gtin: str = ""
     variant: str = ""
     mrp: float | None = None
     selling_price: float | None = None
@@ -31,6 +70,7 @@ class Product:
     description: str = ""
     description_html: str = ""
     ingredients: str = ""
+    key_ingredients: list[str] = field(default_factory=list)
     how_to_use: str = ""
     key_features: list[str] = field(default_factory=list)
     special_features: list[str] = field(default_factory=list)

@@ -52,6 +52,33 @@ class DatabaseTests(unittest.TestCase):
             ["Moisturizers"],
         )
 
+    def test_partial_sweep_never_ages_missing_products(self):
+        session = Mock()
+        session.post.return_value = Mock(status_code=201, text="")
+        session.patch.return_value = Mock(status_code=204, text="")
+        store = SupabaseCatalogStore(
+            url="https://project.supabase.co",
+            service_role_key="secret",
+            session=session,
+        )
+
+        # A brand-filtered or blocked sweep reports complete_catalogue=False,
+        # so the products it never looked at must keep their active state.
+        store.incremental_sync(
+            site="nykaa",
+            run_id="00000000-0000-0000-0000-000000000000",
+            rows=[],
+            price_rows=[],
+            seen_product_ids=[],
+            complete_catalogue=False,
+            missing_runs_before_inactive=3,
+        )
+
+        called = [call.args[0] for call in session.post.call_args_list]
+        self.assertFalse(
+            [url for url in called if "finalize_retailer_scrape_run" in url]
+        )
+
     def test_incomplete_environment_is_rejected(self):
         with patch(
             "pricing_scraper.database._environment",

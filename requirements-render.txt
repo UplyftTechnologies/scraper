@@ -1,3 +1,6 @@
+# Runtime dependencies for the hosted image and the nightly cron jobs.
+# Playwright is deliberately absent: the image has no browsers, so the
+# dashboard offers Nykaa and Tira only. See requirements.txt for local runs.
 requests
 PyYAML
 python-dotenv

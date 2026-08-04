@@ -19,7 +19,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 
-from pricing_scraper.models import Product
+from pricing_scraper.models import Product, brand_key, normalize_gtin
 
 from .base import ConfigurationError, build_logger
 
@@ -48,6 +48,50 @@ def _text(value: Any) -> str:
 
 def _unique(values: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(value for value in values if value))
+
+
+def _attribute_label(key: Any) -> str:
+    """Fold a product-information label, which carries bidi marks and colons."""
+    return re.sub(r"[^a-z0-9]", "", _text(key).casefold())
+
+
+def _by_label(attributes: Mapping[str, Any]) -> dict[str, Any]:
+    return {_attribute_label(key): value for key, value in attributes.items()}
+
+
+def _attribute_gtin(attributes: Mapping[str, Any]) -> str:
+    """Read a barcode from the product-information table when Amazon lists one.
+
+    Amazon India normally publishes only ASIN and manufacturer model numbers,
+    so most beauty products leave this empty.
+    """
+    labelled = _by_label(attributes)
+    for label in ("upc", "ean", "ean13", "gtin", "isbn", "barcode"):
+        gtin = normalize_gtin(labelled.get(label))
+        if gtin:
+            return gtin
+    return ""
+
+
+def _attribute_ingredients(attributes: Mapping[str, Any]) -> list[str]:
+    """Split Amazon's ingredient rows into individual ingredient names.
+
+    ``Special Ingredients`` is Amazon's key-ingredient row; ``Active
+    Ingredients`` is used only as a fallback because it often holds the full
+    INCI list instead.
+    """
+    labelled = _by_label(attributes)
+    raw = _text(
+        labelled.get("specialingredients")
+        or labelled.get("keyingredients")
+        or labelled.get("activeingredients")
+    )
+    names: list[str] = []
+    for part in re.split(r"[;,]", raw):
+        name = _text(part).strip(" .;-–—")
+        if 1 < len(name) <= 80:
+            names.append(name)
+    return _unique(names)
 
 
 def _money(value: Any) -> float | None:
@@ -197,7 +241,7 @@ class AmazonClient:
             1, int(request_config.get("max_requests_per_minute", 12))
         )
         self.brand_filter = {
-            _text(brand).casefold() for brand in brands if _text(brand)
+            brand_key(brand) for brand in brands if brand_key(brand)
         }
         self.logs_dir = Path(
             str(request_config.get("logs_dir") or "logs")
@@ -941,18 +985,20 @@ class AmazonClient:
                     variant = _text(value)
                     if variant:
                         break
+        # Ingredient rows are excluded here: they are names, not features, and
+        # now populate key_ingredients instead.
         special_features = _unique(
             value
             for key, value in attributes.items()
-            if key.casefold()
+            if _attribute_label(key)
             in {
-                "special feature",
-                "active ingredients",
-                "material feature",
-                "skin type",
-                "item form",
+                "specialfeature",
+                "materialfeature",
+                "skintype",
+                "itemform",
             }
         )
+        key_ingredients = _attribute_ingredients(attributes)
         image_urls: list[str] = []
         landing = page.locator("#landingImage")
         if landing.count():
@@ -1084,6 +1130,7 @@ class AmazonClient:
             product_id=asin,
             parent_product_id=parent_asin or asin,
             sku=asin,
+            gtin=_attribute_gtin(attributes),
             brand=brand,
             product_name=title,
             categories=_unique(categories),
@@ -1102,6 +1149,7 @@ class AmazonClient:
             description=description,
             description_html="\n".join(html_parts),
             ingredients=ingredients,
+            key_ingredients=key_ingredients,
             how_to_use=how_to_use,
             key_features=key_features,
             special_features=special_features,
@@ -1209,7 +1257,7 @@ class AmazonClient:
                 )
                 if (
                     self.brand_filter
-                    and product.brand.casefold() not in self.brand_filter
+                    and brand_key(product.brand) not in self.brand_filter
                 ):
                     processed.add(asin)
                     continue

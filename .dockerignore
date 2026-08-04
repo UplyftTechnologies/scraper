@@ -1,11 +1,23 @@
+# Keep the Render build context to source, config, and requirements only.
 .git
+.gitignore
 .venv
 __pycache__
 *.pyc
+.pytest_cache
+.ruff_cache
+
+# Secrets and private captures never belong in the image.
 .env
 config.local.yaml
 private
+
+# Generated locally and rebuilt by each run.
 data
 logs
+
+# Not needed at runtime.
 legacy
 tests
+*.md
+render.yaml

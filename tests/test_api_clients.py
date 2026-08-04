@@ -16,7 +16,7 @@ from pricing_scraper.clients.amazon import (
     _search_asins_from_html,
     _section,
 )
-from pricing_scraper.clients.nykaa import NykaaClient
+from pricing_scraper.clients.nykaa import NykaaClient, _key_ingredients
 from pricing_scraper.clients.tira import TiraClient
 from pricing_scraper.models import Product
 
@@ -252,12 +252,19 @@ class NykaaClientTests(unittest.TestCase):
                 {
                     "id": "parent-1",
                     "parent_id": "parent-1",
+                    "gtin": "8809416470009",
                     "brand_name": "Test Brand",
                     "description": (
                         "<p>Gentle cleanser.</p>"
                         '<img src="https://img.test/content.jpg">'
                     ),
-                    "ingredients": "<p>Water, Ceramide</p>",
+                    "ingredients": (
+                        "<p><b>Key Ingredients:</b></p><ul>"
+                        "<li><b>Ceramide:</b> Repairs the barrier.</li>"
+                        "<li><b>Niacinamide:</b> Evens tone.</li></ul>"
+                        "<p><b>Full Ingredient List:</b> Water, Ceramide, "
+                        "Niacinamide, Glycerin</p>"
+                    ),
                     "use": "<p>Massage and rinse.</p>",
                     "rating": 4.4,
                     "rating_count": 100,
@@ -279,6 +286,7 @@ class NykaaClientTests(unittest.TestCase):
                             "id": "sku-88",
                             "parent_id": "parent-1",
                             "sku": "SKU88",
+                            "gtin": "8809803586047",
                             "name": "Test Cleanser",
                             "pack_size": "88ml",
                             "price": 559,
@@ -323,12 +331,21 @@ class NykaaClientTests(unittest.TestCase):
             self.assertEqual(products[0].selling_price, 475)
             self.assertEqual(products[0].review_count, 25)
             self.assertEqual(products[0].description, "Gentle cleanser.")
-            self.assertEqual(products[0].ingredients, "Water, Ceramide")
+            self.assertEqual(
+                products[0].key_ingredients,
+                ["Ceramide", "Niacinamide"],
+            )
+            # The full INCI list stays in the ingredients column.
+            self.assertIn("Glycerin", products[0].ingredients)
             self.assertIn(
                 "https://img.test/content.jpg",
                 products[0].image_urls,
             )
             self.assertTrue(products[0].top_reviews[0]["verified_buyer"])
+            self.assertEqual(products[0].gtin, "8809803586047")
+            # The parent barcode describes the parent SKU, so the second size
+            # stays blank instead of inheriting a barcode that is not its own.
+            self.assertEqual(products[1].gtin, "")
 
     def test_resumable_scrape_stops_only_after_empty_page(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -456,7 +473,9 @@ class NykaaClientTests(unittest.TestCase):
             client = NykaaClient(
                 site_config,
                 request_config(Path(directory)),
-                brands=["minimalist"],
+                # Punctuation and spacing differ across storefronts, so the
+                # filter matches "Minimalist" from a loosely typed entry.
+                brands=[" minimalist. "],
                 session=session,
                 sleeper=lambda _seconds: None,
                 random_uniform=lambda low, _high: low,
@@ -527,6 +546,43 @@ class NykaaClientTests(unittest.TestCase):
             )
 
 
+class NykaaKeyIngredientTests(unittest.TestCase):
+    """Nykaa writes key ingredients in more than one shape on the same field."""
+
+    def test_reads_the_bulleted_form(self):
+        self.assertEqual(
+            _key_ingredients(
+                "<p><b>Key Ingredients:</b></p><ul>"
+                "<li><b>Snail Secretion Filtrate:</b> Hydrates.</li>"
+                "<li><b>Sodium Hyaluronate (Hyaluronic Acid):</b> Plumps.</li>"
+                "</ul><p><b>Full Ingredient List:</b> Betaine, Carbomer</p>"
+            ),
+            ["Snail Secretion Filtrate", "Sodium Hyaluronate (Hyaluronic Acid)"],
+        )
+
+    def test_reads_the_inline_form(self):
+        self.assertEqual(
+            _key_ingredients(
+                "<p><b>Key Ingredients: </b>Niacinamide:Brightens skin tone."
+                "Panthenol:Moisturizes and soothes.</p>"
+            ),
+            ["Niacinamide", "Panthenol"],
+        )
+
+    def test_ignores_products_that_publish_only_an_inci_list(self):
+        self.assertEqual(_key_ingredients("<p>Water, Glycerin, Betaine</p>"), [])
+        # A bulleted shade breakdown has no heading, so it is not mistaken
+        # for a key-ingredient list.
+        self.assertEqual(
+            _key_ingredients(
+                "<ul><li><b>Strawberry Ade:</b> Water, Butylene Glycol</li></ul>"
+            ),
+            [],
+        )
+        self.assertEqual(_key_ingredients(""), [])
+        self.assertEqual(_key_ingredients(None), [])
+
+
 class TiraClientTests(unittest.TestCase):
     @staticmethod
     def site_config():
@@ -571,6 +627,8 @@ class TiraClientTests(unittest.TestCase):
                     "attributes": {
                         "identifier": {"sku_code": ["SKU-50"]},
                         "pack-size": "50 ml",
+                        "preference": ["Cruelty Free"],
+                        "super-ingredients": ["Ceramide", "Glycerin"],
                         "description": (
                             "<h3>Description</h3><p>Gentle daily cleanser.</p>"
                             "<h3>Ingredients</h3><p>Water, glycerin.</p>"
@@ -615,6 +673,13 @@ class TiraClientTests(unittest.TestCase):
             self.assertIn("Gentle daily cleanser", products[0].description)
             self.assertEqual(products[0].ingredients, "Water, glycerin.")
             self.assertEqual(products[0].how_to_use, "Massage and rinse.")
+            # Super-ingredients are ingredient names, so they leave the
+            # special-features column and stand on their own.
+            self.assertEqual(
+                products[0].key_ingredients,
+                ["Ceramide", "Glycerin"],
+            )
+            self.assertEqual(products[0].special_features, ["Cruelty Free"])
 
     def test_selects_every_enabled_collection_without_a_covering_parent(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,7 +1,7 @@
-requests
-PyYAML
-openpyxl
-python-dotenv
-streamlit>=1.57
+# Local development: everything the hosted image installs, plus the browser
+# stack that only Amazon needs. Shared pins live in requirements-render.txt so
+# the two files cannot drift apart.
+-r requirements-render.txt
+
 playwright>=1.61
 playwright-stealth>=2.0

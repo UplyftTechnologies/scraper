@@ -9,15 +9,48 @@ retailers into one comparison workbook and CSV.
 Each SKU/size is a separate row. The normalized output includes:
 
 - retailer, category memberships, parent ID, product ID, and SKU/ASIN
+- GTIN/EAN/UPC barcode where the retailer publishes one (see below)
 - brand, product name, variant/size, MRP, selling price, discount, and stock
 - overall rating, rating count, review count, rating breakdown, and selected
   visible reviews
 - product URL, primary image, all gallery images, description HTML/text,
-  ingredients, directions/how to use, key features, special features, and
-  structured product attributes
+  ingredients, key ingredients, directions/how to use, key features, special
+  features, and structured product attributes
 
 Not every retailer publishes every field for every product. Missing source
 values remain blank rather than being guessed.
+
+### Key ingredients
+
+`key_ingredients` is a separate list column holding only the highlighted
+ingredient names. The full INCI list stays in `ingredients`.
+
+- **Nykaa** embeds the section inside the ingredients HTML, either as a
+  bulleted list or as one inline paragraph; both forms are parsed, and a
+  product that publishes only an INCI list yields an empty list.
+- **Tira** publishes `super-ingredients`. These used to be merged into
+  `special_features` alongside claims such as `Cruelty Free`; they now appear
+  in `key_ingredients` only, so `special_features` holds claims alone.
+- **Amazon India** uses the `Special Ingredients` row, falling back to
+  `Active Ingredients`. That row is no longer copied into `special_features`,
+  where it previously dumped the entire ingredient list into a feature cell.
+
+### GTIN/EAN/UPC
+
+The `gtin` column holds the retailer's own barcode for that exact SKU:
+
+- **Nykaa** publishes one per SKU, so this column is populated for Nykaa rows.
+- **Tira** publishes only its internal numeric item code, which is already
+  exported as `sku`. `gtin` stays blank unless Tira starts returning a real
+  barcode in its identifier lists.
+- **Amazon India** does not list UPC/EAN on beauty product pages — the detail
+  table carries ASIN, model number, and part number only — so `gtin` stays
+  blank. The parser still reads a `UPC`/`EAN`/`GTIN` row if one appears.
+
+The `gtin` value is only accepted when it is a digit string of GTIN-8/12/13/14 length
+whose GS1 check digit is valid, so a seller code that merely looks numeric is
+never exported as a barcode. Parent-level barcodes are never copied onto other
+size variants: each row carries its own barcode or nothing.
 
 The configured comparison taxonomy is identical for all three sites:
 
@@ -28,33 +61,68 @@ The configured comparison taxonomy is identical for all three sites:
 
 ## Project layout
 
+Two entry points, one library, one config file:
+
 ```text
-pricing_scraper/
+main.py                  # python main.py -> dashboard; with arguments -> CLI
+streamlit_app.py         # the dashboard itself (Streamlit runs this file)
+app_auth.py              # password gate for the hosted deployment
+
+pricing_scraper/         # all scraping and export logic
   clients/
-    base.py          # requests session, cURL parsing, retry/rate limiting
-    nykaa.py         # Nykaa listing/detail JSON APIs
-    tira.py          # Tira listing/variant JSON APIs
-    amazon.py        # Playwright search and public product pages
-  checkpoint.py      # resumable listing and product-detail checkpoints
-  cli.py
-  config.py
-  dashboard_service.py
-  exporter.py
-  models.py
-app_pages/
-  scraper.py         # "Scraper" tab
-  product_view.py    # "Product view" tab
-streamlit_app.py     # entry point: both tabs
-product_viewer_app.py # entry point: product view only (hosted deployment)
-dashboard.py
-config.yaml
-config.local.yaml    # ignored private Nykaa override
-private/             # ignored captured cURL/session files
-data/                # generated output/checkpoints
-logs/                # request logs, failures, CAPTCHA screenshots
+    base.py              # requests session, cURL parsing, retry/rate limiting
+    nykaa.py             # Nykaa listing/detail JSON APIs
+    tira.py              # Tira listing/variant JSON APIs
+    amazon.py            # Playwright search and public product pages
+  automation.py          # nightly incremental sweep
+  checkpoint.py          # resumable listing and product-detail checkpoints
+  cli.py                 # command-line interface
+  config.py              # YAML loading and .env overrides
+  dashboard_service.py   # collection runs the dashboard calls
+  database.py            # Supabase sync
+  exporter.py            # Excel/CSV output
+  models.py              # the Product record
+  scheduler.py           # cron entry point
+
+config.yaml              # retailers, categories, request limits
+database/                # Supabase schema and migrations
 tests/
-main.py
+requirements.txt         # local install (includes Playwright for Amazon)
+requirements-render.txt  # hosted install (no Playwright)
+Dockerfile, render.yaml  # deployment
+
+config.local.yaml        # ignored private Nykaa override
+.env                     # ignored secrets and SCRAPE_BRANDS
+private/                 # ignored captured cURL/session files
+data/                    # generated output and checkpoints
+logs/                    # request logs, failures, CAPTCHA screenshots
 ```
+
+## Limiting the run to specific brands
+
+`SCRAPE_BRANDS` in `.env` restricts every retailer to a comma-separated list:
+
+```dotenv
+SCRAPE_BRANDS=COSRX, Laneige, d'Alba Piedmont
+```
+
+Leave it blank to keep every brand the retailer returns. The variable replaces
+the `brands:` list in `config.yaml` whenever it is set, and it applies to the
+dashboard, the CLI, and the nightly scheduler alike.
+
+Matching ignores case, spacing, and punctuation, so `dalba piedmont` still
+matches `d'Alba Piedmont`. It is otherwise an exact brand-name match: a
+partial name such as `d'Alba` does not match `d'Alba Piedmont`, so copy the
+brand exactly as the retailer displays it. The sidebar shows the active list,
+and an unmatched name simply contributes no rows.
+
+Brands are filtered while listings are parsed, so a filtered Nykaa or Tira run
+skips the product-detail requests for excluded products. Amazon searches by
+category first and drops non-matching brands from the results.
+
+A brand-filtered nightly run is treated as a partial sweep: it never sees the
+rest of the catalogue, so it never ages other brands into `is_active = false`.
+Filtered runs still add and update rows normally.
 
 ## Setup
 
@@ -94,10 +162,16 @@ The current Supabase secret key is preferred; the integration also accepts the
 legacy `SUPABASE_SERVICE_ROLE_KEY`. `.env` is ignored by Git. Both key types
 must stay server-side and must never be embedded in a frontend or committed.
 
-If the original tables already exist, run
-`database/002_nightly_automation.sql` once. It adds durable run history,
-comparison fingerprints, last-seen timestamps, and safe missing-product
-tracking without deleting current catalogue rows.
+On an existing project, apply the migrations once, in order:
+
+- `database/002_nightly_automation.sql` adds durable run history, comparison
+  fingerprints, last-seen timestamps, and safe missing-product tracking
+  without deleting current catalogue rows.
+- `database/003_product_columns.sql` adds the `gtin` and `key_ingredients`
+  columns.
+
+Supabase rejects the whole product sync until a new column exists, so apply
+the migrations before the next run.
 
 ## Nightly incremental automation
 
@@ -115,47 +189,56 @@ only when price or stock changes. Products absent from three complete sweeps
 become inactive; partial or blocked sweeps never age missing products.
 
 Every run is saved in `retailer_scrape_runs` with independent Nykaa/Tira
-status, product counts, failures, blocks, requests, and start/end times. The
-hosted product viewer displays the latest result for both retailers.
+status, product counts, failures, blocks, requests, and start/end times.
 
 ### Render deployment
 
-`render.yaml` creates three services:
+Everything the platform needs is committed: one `Dockerfile` builds the image,
+and `render.yaml` declares all three services. Deploy in three steps:
 
-- `beauty-catalogue`: the `streamlit_app.py` Scraper and Product view tabs
+1. Run `database/schema.sql` (new project) or the migrations above (existing
+   project) in the Supabase SQL Editor.
+2. In Render, choose **New → Blueprint** and point it at this repository.
+3. Fill in the secret values Render prompts for (listed below), then deploy.
+
+Deploy as a **Blueprint**, not as a single Web Service. Creating the service by
+hand ignores `render.yaml`, so the environment values below are never applied
+and the two cron jobs are never created.
+
+The blueprint creates:
+
+- `beauty-catalogue`: the `streamlit_app.py` dashboard, bound to Render's
+  `${PORT}` by the Dockerfile
 - `beauty-nykaa-nightly`: daily at 19:00 UTC (00:30 IST)
 - `beauty-tira-nightly`: daily at 20:00 UTC (01:30 IST)
 
-Deploy the repository as a Render **Blueprint**, not as a single Web Service.
-Creating the service by hand ignores `render.yaml`, so the environment values
-below are never applied and the two cron jobs are never created. Enter these
-server-side values when requested:
+All three build from the same image and install `requirements-render.txt`.
+Enter these server-side values when requested:
 
 ```text
 APP_PASSWORD            # Web service only: password gate for the public URL
 SUPABASE_URL
 SUPABASE_SECRET_KEY
-NYKAA_CURL_COMMAND      # Nykaa job and the hosted Scraper tab
-TIRA_APPLICATION_ID     # Tira job and the hosted Scraper tab
-TIRA_APPLICATION_TOKEN  # Tira job and the hosted Scraper tab
+NYKAA_CURL_COMMAND      # Nykaa job and the hosted dashboard
+TIRA_APPLICATION_ID     # Tira job and the hosted dashboard
+TIRA_APPLICATION_TOKEN  # Tira job and the hosted dashboard
 ```
 
-The hosted Scraper tab can start runs that write to Supabase, so `app_auth.py`
-gates both entry points behind `APP_PASSWORD` before any page renders. A
+The hosted dashboard can start runs that write to Supabase, so `app_auth.py`
+gates the entry point behind `APP_PASSWORD` before any page renders. A
 deployment with `HOSTED_DASHBOARD=true` and no `APP_PASSWORD` refuses to serve
 rather than publishing the dashboard. Local runs leave the variable unset and
 are never prompted. The session unlocks per browser tab, so a reload asks
 again.
 
-The hosted Scraper tab offers Nykaa and Tira only. `requirements-render.txt`
+The hosted dashboard offers Nykaa and Tira only. `requirements-render.txt`
 omits Playwright, so `amazon_dependencies_available()` reports `False` and the
 retailer list drops Amazon rather than offering a run that cannot start.
 Amazon stays local, and is intentionally absent from `render.yaml` too.
 
 Render web and cron filesystems are temporary, so anything a hosted run writes
 to `data/` or `logs/` disappears on the next deploy or restart. Only the
-Supabase rows survive, which is why `HOSTED_DASHBOARD=true` makes the Product
-view read the database instead of local checkpoints.
+Supabase rows survive.
 
 Test the production commands locally before deploying:
 
@@ -180,37 +263,6 @@ The dashboard shows **Scraping complete** only after the selected listing and
 detail work is complete and the Excel/CSV files are written. Interrupted runs
 resume from `data/checkpoints/`. Refreshing one retailer preserves rows already
 saved for the other retailers.
-
-## Read-only product viewer
-
-The dashboard has two top tabs — **Scraper** and **Product view** — so the
-viewer is available in the same app on port `8501` without a second process.
-
-Run the independent viewer in a second terminal when you want it on its own
-port while scraping continues:
-
-```powershell
-cd D:\scraper
-.\.venv\Scripts\Activate.ps1
-python product_viewer.py
-```
-
-Open <http://127.0.0.1:8502>. That entry point shows only the product view and
-never writes to checkpoints, exports, or the database.
-
-The default **Live checkpoints** source shows products before the current run
-reaches its final Excel/database synchronization. It refreshes every 15
-seconds and includes a retail-style product grid plus dedicated product pages
-with galleries, variants, prices, stock, descriptions, ingredients, usage,
-attributes, ratings, and reviews. A raw data-table view, filters, pagination,
-and filtered CSV download remain available. You can also switch to
-**Supabase database** or **Latest exported CSV**.
-
-Use another port when needed:
-
-```powershell
-python product_viewer.py --port 8503
-```
 
 ## CLI
 

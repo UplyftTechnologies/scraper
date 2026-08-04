@@ -7,8 +7,35 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv import dotenv_values
 
 from pricing_scraper.clients.base import ConfigurationError
+
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+
+
+def environment_values() -> dict[str, str]:
+    """Merge the private .env file with the real environment.
+
+    Real environment variables win, so a Render service variable still
+    overrides a value left behind in a local .env file.
+    """
+    file_values = {
+        str(key): str(value)
+        for key, value in dotenv_values(ENV_FILE).items()
+        if value is not None
+    }
+    return {**file_values, **dict(os.environ)}
+
+
+def parse_brand_filter(value: Any) -> list[str]:
+    """Split a comma-separated brand list into unique, ordered brand names."""
+    seen: dict[str, str] = {}
+    for part in str(value or "").replace("\n", ",").split(","):
+        brand = " ".join(part.split())
+        if brand:
+            seen.setdefault(brand.casefold(), brand)
+    return list(seen.values())
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -67,17 +94,23 @@ def load_config(path: Path, _seen: set[Path] | None = None) -> dict[str, Any]:
 
 
 def apply_environment_overrides(config: dict[str, Any]) -> None:
-    """Let hosted secrets replace the credentials committed in the YAML."""
-    nykaa_command = os.getenv("NYKAA_CURL_COMMAND", "").strip()
-    nykaa_file = os.getenv("NYKAA_CURL_FILE", "").strip()
+    """Let .env and hosted secrets replace the values committed in the YAML."""
+    values = environment_values()
+    nykaa_command = values.get("NYKAA_CURL_COMMAND", "").strip()
+    nykaa_file = values.get("NYKAA_CURL_FILE", "").strip()
     if nykaa_command:
         config["nykaa"]["curl_command"] = nykaa_command
         config["nykaa"]["curl_file"] = ""
     elif nykaa_file:
         config["nykaa"]["curl_file"] = nykaa_file
-    tira_id = os.getenv("TIRA_APPLICATION_ID", "").strip()
-    tira_token = os.getenv("TIRA_APPLICATION_TOKEN", "").strip()
+    tira_id = values.get("TIRA_APPLICATION_ID", "").strip()
+    tira_token = values.get("TIRA_APPLICATION_TOKEN", "").strip()
     if tira_id:
         config["tira"]["application_id"] = tira_id
     if tira_token:
         config["tira"]["application_token"] = tira_token
+    brands = parse_brand_filter(values.get("SCRAPE_BRANDS"))
+    if brands:
+        # An empty or absent variable keeps the YAML list, so clearing the
+        # filter is deliberate rather than a side effect of a blank line.
+        config["brands"] = brands
