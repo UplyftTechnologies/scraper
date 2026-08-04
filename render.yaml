@@ -15,9 +15,10 @@ services:
       # until this is set. Only the web service needs it.
       - key: APP_PASSWORD
         sync: false
-      # Comma-separated brand allowlist. Blank keeps every brand.
+      # Comma-separated brand allowlist, entered per environment. Leave the
+      # prompt blank to keep every brand the retailer returns.
       - key: SCRAPE_BRANDS
-        value: ""
+        sync: false
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SECRET_KEY
@@ -50,7 +51,7 @@ services:
       - key: SUPABASE_RUNS_TABLE
         value: retailer_scrape_runs
       - key: SCRAPE_BRANDS
-        value: ""
+        sync: false
       - key: NYKAA_CURL_COMMAND
         sync: false
 
@@ -71,7 +72,7 @@ services:
       - key: SUPABASE_RUNS_TABLE
         value: retailer_scrape_runs
       - key: SCRAPE_BRANDS
-        value: ""
+        sync: false
       - key: TIRA_APPLICATION_ID
         sync: false
       - key: TIRA_APPLICATION_TOKEN
