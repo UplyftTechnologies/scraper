@@ -6,6 +6,7 @@ Run it with ``python main.py`` or ``streamlit run streamlit_app.py``.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,15 @@ from pricing_scraper.dashboard_service import (
     collect_amazon,
     collect_nykaa,
     collect_tira,
+)
+from pricing_scraper.background import (
+    ACTIVE_STATES,
+    RunRequest,
+    active_status,
+    latest_status,
+    read_status,
+    request_stop,
+    start_run,
 )
 from pricing_scraper.exporter import load_products_csv
 
@@ -148,6 +158,7 @@ require_password()
 st.session_state.setdefault("products", [])
 st.session_state.setdefault("last_run", {})
 st.session_state.setdefault("dashboard_error", "")
+st.session_state.setdefault("run_id", "")
 
 st.title("Beauty pricing dashboard")
 st.caption(
@@ -284,7 +295,9 @@ with st.sidebar:
         )
     st.caption(
         "Large catalogue runs can take several hours due to rate limits. "
-        "Listing pages and detail/variant requests are checkpointed."
+        "Listing pages and detail/variant requests are checkpointed. The run "
+        "continues on the server after you close this tab; reopen the "
+        "dashboard to see its progress."
     )
 
 if submitted:
@@ -301,222 +314,115 @@ if submitted:
         )
     else:
         st.session_state.dashboard_error = ""
-        st.session_state.last_run = {}
-        with st.status(
-            f"Collecting {retailer} prices...",
-            expanded=True,
-        ) as status:
-            try:
-                with st.container(horizontal=True):
-                    listing_count = st.empty()
-                    parent_count = st.empty()
-                    sku_count = st.empty()
-                listing_count.metric(
-                    "Products discovered",
-                    "0",
-                    border=True,
+        try:
+            started = start_run(
+                RunRequest(
+                    site=site_key,
+                    categories=list(selected_categories),
+                    page_limit=int(page_limit),
+                    resume=bool(resume_run),
+                    enrich_details=bool(enrich_details),
+                    config_path=str(config_path),
                 )
-                parent_count.metric(
-                    (
-                        "Detail parents"
-                        if site_key == "nykaa"
-                        else "Variant prices"
-                        if site_key == "tira"
-                        else "Product pages"
-                    ),
-                    "0",
-                    border=True,
-                )
-                sku_count.metric(
-                    (
-                        "Enriched SKU rows"
-                        if site_key == "nykaa"
-                        else "Priced SKU rows"
-                        if site_key == "tira"
-                        else "Amazon ASIN rows"
-                    ),
-                    "0",
-                    border=True,
-                )
-                detail_progress = st.progress(
-                    0,
-                    text="Discovering product catalogue",
-                )
-                live_progress = {
-                    "percent": 0,
-                    "listing_products": 0,
-                    "detail_parents": 0,
-                    "sku_rows": 0,
-                }
+            )
+            st.session_state.run_id = started["run_id"]
+            st.session_state.products = []
+            st.session_state.last_run = {}
+        except Exception as exc:
+            st.session_state.dashboard_error = str(exc)
+        st.rerun()
 
-                def report_progress(
-                    stage: str,
-                    current: int,
-                    total: int,
-                    message: str,
-                ) -> None:
-                    if stage == "listing_products":
-                        live_progress["listing_products"] = current
-                        listing_count.metric(
-                            "Products discovered",
-                            f"{current:,}",
-                            border=True,
-                        )
-                    elif stage == "details":
-                        live_progress["detail_parents"] = current
-                        parent_count.metric(
-                            (
-                                "Detail parents"
-                                if site_key == "nykaa"
-                                else "Variant prices"
-                                if site_key == "tira"
-                                else "Product pages"
-                            ),
-                            (
-                                f"{current:,} / {total:,}"
-                                if total
-                                else f"{current:,}"
-                            ),
-                            border=True,
-                        )
-                    elif stage == "sku_rows":
-                        live_progress["sku_rows"] = current
-                        sku_count.metric(
-                            (
-                                "Enriched SKU rows"
-                                if site_key == "nykaa"
-                                else "Priced SKU rows"
-                                if site_key == "tira"
-                                else "Amazon ASIN rows"
-                            ),
-                            f"{current:,}",
-                            border=True,
-                        )
 
-                    if total and stage in {"listing", "details"}:
-                        live_progress["percent"] = min(
-                            100,
-                            int((current / total) * 100),
-                        )
-                    detail_progress.progress(
-                        live_progress["percent"],
-                        text=message,
-                    )
+def run_panel() -> None:
+    """Show the detached run's progress, refreshed while it is still working.
 
-                st.write(
-                    f"Fetching {len(selected_categories)} category selection(s), "
-                    f"up to {int(page_limit)} page(s) each."
-                )
-                collector = {
-                    "nykaa": collect_nykaa,
-                    "tira": collect_tira,
-                    "amazon": collect_amazon,
-                }[site_key]
-                result = collector(
-                    config,
-                    selected_categories,
-                    int(page_limit),
-                    resume=resume_run,
-                    enrich_details=enrich_details,
-                    progress_callback=report_progress,
-                )
-                listing_count.metric(
-                    "Products discovered",
-                    f"{result.listing_products:,}",
-                    border=True,
-                )
-                parent_count.metric(
-                    (
-                        "Detail parents"
-                        if site_key == "nykaa"
-                        else "Variant prices"
-                        if site_key == "tira"
-                        else "Product pages"
-                    ),
-                    f"{result.detail_parents:,}",
-                    border=True,
-                )
-                sku_count.metric(
-                    "Export rows ready",
-                    f"{len(result.products):,}",
-                    border=True,
-                )
-                detail_progress.progress(
-                    100,
-                    text=(
-                        "Catalogue and product details processed"
-                        if enrich_details
-                        else "Catalogue processed"
-                    ),
-                )
-                st.write(
-                    f"Discovered {result.listing_products:,} listing products, "
-                    f"processed {result.detail_parents:,} parent products, and "
-                    f"exported {len(result.products):,} separate SKU rows."
-                )
-                if result.resumed_products:
-                    st.write(
-                        f"Resumed with {result.resumed_products:,} products "
-                        "from the previous checkpoint."
-                    )
-                if result.export.database_enabled:
-                    st.success(
-                        "Database synchronized: "
-                        f"{result.export.database_products_written:,} current "
-                        "product rows and "
-                        f"{result.export.database_price_points_written:,} "
-                        "price-history points.",
-                        icon=":material/database:",
-                    )
-                    if result.export.database_error:
-                        st.warning(result.export.database_error)
-                else:
-                    st.info(
-                        "Database storage is disabled. Add Supabase "
-                        "credentials to `.env` to enable it.",
-                        icon=":material/database_off:",
-                    )
-                st.session_state.products = [
-                    product.to_dict()
-                    for product in load_products_csv(result.export.csv_path)
-                ]
-                st.session_state.last_run = {
-                    "site": site_key,
-                    "failures": result.failures,
-                    "blocks": result.blocks,
-                    "requests": result.requests,
-                    "excel_path": str(result.export.excel_path),
-                    "csv_path": str(result.export.csv_path),
-                    "completed": result.completed,
-                    "next_page": result.next_page,
-                    "stop_reasons": list(result.stop_reasons),
-                    "products_written": result.export.products_written,
-                    "listing_products": result.listing_products,
-                    "detail_parents": result.detail_parents,
-                }
-                if result.completed:
-                    status.update(
-                        label="Scraping complete",
-                        state="complete",
-                        expanded=False,
-                    )
-                    st.toast(
-                        "Scraping complete",
-                        icon=":material/check_circle:",
-                    )
-                else:
-                    status.update(
-                        label="Scraping paused — checkpoint saved",
-                        state="error",
-                        expanded=True,
-                    )
-            except Exception as exc:
-                st.session_state.dashboard_error = str(exc)
-                status.update(
-                    label="Collection failed",
-                    state="error",
-                    expanded=True,
-                )
+    The worker owns the run, so this panel is only a reader: closing the tab
+    or reopening the dashboard later reattaches to the same status file.
+    """
+    status = active_status() or (
+        read_status(st.session_state.run_id)
+        if st.session_state.get("run_id")
+        else None
+    ) or latest_status()
+    if not status:
+        return
+
+    state = str(status.get("state") or "")
+    running = state in ACTIVE_STATES
+    label = {
+        "starting": f"Starting {status.get('site', '')} collection...",
+        "running": f"Collecting {status.get('site', '')} prices...",
+        "success": "Scraping complete",
+        "incomplete": "Scraping paused - checkpoint saved",
+        "stopped": "Run stopped",
+        "failed": "Collection failed",
+    }.get(state, state.title())
+
+    with st.status(label, expanded=running or state in {"failed", "incomplete"}):
+        with st.container(horizontal=True):
+            st.metric(
+                "Products discovered",
+                f"{int(status.get('listing_products', 0)):,}",
+                border=True,
+            )
+            st.metric(
+                "Detail parents",
+                f"{int(status.get('detail_parents', 0)):,}",
+                border=True,
+            )
+            st.metric(
+                "SKU rows",
+                f"{int(status.get('sku_rows', 0)):,}",
+                border=True,
+            )
+        st.progress(
+            int(status.get("percent", 0)),
+            text=str(status.get("message") or ""),
+        )
+        st.caption(
+            f"Run `{status.get('run_id', '')}` started {status.get('started_at', '')}"
+            " (UTC). This run continues on the server if you close this tab."
+        )
+        if running:
+            if st.button("Stop this run", icon=":material/stop_circle:"):
+                request_stop(str(status["run_id"]))
+                st.rerun()
+        if status.get("error"):
+            st.error(status["error"])
+        if status.get("database_error"):
+            st.warning(status["database_error"])
+        if state == "success" and status.get("database_enabled"):
+            st.success(
+                "Database synchronized: "
+                f"{int(status.get('database_products_written', 0)):,} product "
+                "rows and "
+                f"{int(status.get('database_price_points_written', 0)):,} "
+                "price-history points.",
+                icon=":material/database:",
+            )
+
+    if running:
+        # Cheap poll: the worker rewrites the status file as it progresses.
+        time.sleep(3)
+        st.rerun()
+    elif state in {"success", "incomplete", "stopped"}:
+        st.session_state.last_run = {
+            "site": status.get("site", ""),
+            "completed": bool(status.get("completed")),
+            "next_page": status.get("next_page"),
+            "stop_reasons": list(status.get("stop_reasons", ())),
+            "products_written": int(status.get("products_written", 0)),
+            "excel_path": status.get("excel_path", ""),
+            "csv_path": status.get("csv_path", ""),
+            "failures": status.get("failures", 0),
+            "blocks": status.get("blocks", 0),
+            "requests": status.get("requests", 0),
+            "listing_products": status.get("listing_products", 0),
+            "detail_parents": status.get("detail_parents", 0),
+        }
+
+
+run_panel()
 
 if st.session_state.dashboard_error:
     st.error(st.session_state.dashboard_error)

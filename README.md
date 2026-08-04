@@ -264,6 +264,29 @@ detail work is complete and the Excel/CSV files are written. Interrupted runs
 resume from `data/checkpoints/`. Refreshing one retailer preserves rows already
 saved for the other retailers.
 
+### Runs continue after you close the browser
+
+Selecting **Collect latest prices** starts the collection in a separate
+process, so it is not tied to the browser session. Close the tab, put the
+machine's browser away, or reopen the dashboard from another device: the run
+keeps going and the dashboard reattaches to its progress.
+
+This matters because Streamlit drops a session about two minutes after its tab
+closes, which would otherwise kill a multi-hour collection.
+
+- Progress, counters, and the outcome live in `data/runs/<run_id>.status.json`;
+  the worker's output is in the matching `.log` file.
+- One run at a time. A second start is refused while a run is working, because
+  concurrent runs would write the same checkpoints and export files.
+- **Stop this run** asks the worker to stop at its next progress checkpoint,
+  leaving the checkpoint intact so the next run resumes from there.
+- A worker that dies without finishing is reported as failed the next time the
+  dashboard looks, rather than blocking new runs.
+
+The run lives in the server process, not the browser, so it still ends if the
+server itself stops. On Render that means a restart or redeploy cancels an
+in-flight run; the checkpoint survives only until the container is replaced.
+
 ## CLI
 
 PowerShell arguments must be entered on the same command line:
