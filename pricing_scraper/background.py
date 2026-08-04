@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -69,6 +70,31 @@ def log_path(run_id: str, root: Path | None = None) -> Path:
     return runs_dir(root) / f"{run_id}.log"
 
 
+def read_log(
+    run_id: str,
+    *,
+    lines: int = 200,
+    root: Path | None = None,
+    max_bytes: int = 256_000,
+) -> str:
+    """Return the tail of a run's log.
+
+    Only the last max_bytes are read, so a run that has logged one line per
+    request for hours still renders instantly.
+    """
+    path = log_path(run_id, root)
+    try:
+        size = path.stat().st_size
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+                handle.readline()  # Drop the partial line the seek landed in.
+            tail = handle.read()
+    except OSError:
+        return ""
+    return "\n".join(tail.splitlines()[-max(1, lines):])
+
+
 def write_status(
     run_id: str,
     values: Mapping[str, Any],
@@ -83,14 +109,38 @@ def write_status(
     status = read_status(run_id, root=root) or {"run_id": run_id}
     status.update(values)
     status["updated_at"] = _now()
+    payload = json.dumps(status, ensure_ascii=False, indent=2)
     path = _status_path(run_id, root)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(status, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    temporary.write_text(payload, encoding="utf-8")
+    for attempt in range(5):
+        try:
+            os.replace(temporary, path)
+            return status
+        except PermissionError:
+            # Windows refuses to replace a file another process has open, and
+            # the dashboard polls this file constantly. Retry, then fall back.
+            time.sleep(0.05 * (attempt + 1))
+    path.write_text(payload, encoding="utf-8")
+    temporary.unlink(missing_ok=True)
     return status
+
+
+def update_status_safely(
+    run_id: str,
+    values: Mapping[str, Any],
+    *,
+    root: Path | None = None,
+) -> None:
+    """Write status without ever interrupting the collection.
+
+    A status file is only a progress report. Losing one must never abandon a
+    run that has already spent hours on rate-limited requests.
+    """
+    try:
+        write_status(run_id, values, root=root)
+    except OSError as exc:
+        print(f"status_write_failed run={run_id} error={exc}", file=sys.stderr)
 
 
 def read_status(
@@ -100,11 +150,17 @@ def read_status(
 ) -> dict[str, Any] | None:
     """Read one run's status, or None when it has never been written."""
     path = _status_path(run_id, root)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return payload if isinstance(payload, dict) else None
+    for attempt in range(3):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            # The worker may be mid-replace; a moment later the file is whole.
+            time.sleep(0.05 * (attempt + 1))
+            continue
+        return payload if isinstance(payload, dict) else None
+    return None
 
 
 def all_statuses(root: Path | None = None) -> list[dict[str, Any]]:
@@ -278,7 +334,12 @@ def _execute(run_id: str, *, root: Path | None = None) -> int:
     config = load_config(Path(str(job["config_path"])))
     apply_environment_overrides(config)
 
-    counters = {"listing_products": 0, "detail_parents": 0, "sku_rows": 0}
+    counters = {
+        "listing_products": 0,
+        "detail_parents": 0,
+        "sku_rows": 0,
+        "percent": 0,
+    }
 
     def report(stage: str, current: int, total: int, message: str) -> None:
         if stop_requested(run_id, root=root):
@@ -289,10 +350,13 @@ def _execute(run_id: str, *, root: Path | None = None) -> int:
             counters["detail_parents"] = current
         elif stage in {"detail_products", "sku_rows"}:
             counters["sku_rows"] = current
-        percent = int(min(100, max(0, (current / total) * 100))) if total else 0
-        write_status(
+        if total:
+            # Stages that report no total (running counts such as SKU rows)
+            # keep the last real percentage instead of resetting the bar.
+            counters["percent"] = int(min(100, max(0, (current / total) * 100)))
+        update_status_safely(
             run_id,
-            {"stage": stage, "percent": percent, "message": message, **counters},
+            {"stage": stage, "message": message, **counters},
             root=root,
         )
 

@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pricing_scraper.background import (
     RunRequest,
@@ -11,6 +12,7 @@ from pricing_scraper.background import (
     request_stop,
     start_run,
     stop_requested,
+    update_status_safely,
     write_status,
 )
 
@@ -101,6 +103,34 @@ class BackgroundRunTests(unittest.TestCase):
             self.assertEqual(status["state"], "failed")
             self.assertIn("exited without finishing", status["error"])
             self.assertIsNone(active_status(root))
+
+    def test_status_survives_a_locked_destination_file(self):
+        # Windows refuses os.replace while another process has the status file
+        # open, and the dashboard polls it constantly.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_status("run-5", {"state": "running", "percent": 5}, root=root)
+
+            with patch(
+                "pricing_scraper.background.os.replace",
+                side_effect=PermissionError(5, "Access is denied"),
+            ):
+                write_status("run-5", {"percent": 50}, root=root)
+
+            status = read_status("run-5", root=root)
+            self.assertEqual(status["percent"], 50)
+            self.assertEqual(status["state"], "running")
+
+    def test_a_failed_status_write_never_aborts_the_run(self):
+        # Losing a progress report must not abandon a collection that has
+        # already spent hours on rate-limited requests.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch(
+                "pricing_scraper.background.write_status",
+                side_effect=OSError("disk full"),
+            ):
+                update_status_safely("run-6", {"percent": 20}, root=root)
 
     def test_latest_status_prefers_the_newest_run(self):
         with tempfile.TemporaryDirectory() as directory:

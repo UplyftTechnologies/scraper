@@ -6,7 +6,6 @@ Run it with ``python main.py`` or ``streamlit run streamlit_app.py``.
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +30,7 @@ from pricing_scraper.background import (
     RunRequest,
     active_status,
     latest_status,
+    read_log,
     read_status,
     request_stop,
     start_run,
@@ -333,20 +333,25 @@ if submitted:
         st.rerun()
 
 
-def run_panel() -> None:
-    """Show the detached run's progress, refreshed while it is still working.
+def current_status() -> dict[str, Any] | None:
+    """Find the run this dashboard should display."""
+    return (
+        active_status()
+        or (
+            read_status(st.session_state.run_id)
+            if st.session_state.get("run_id")
+            else None
+        )
+        or latest_status()
+    )
 
-    The worker owns the run, so this panel is only a reader: closing the tab
-    or reopening the dashboard later reattaches to the same status file.
+
+def render_run(status: dict[str, Any]) -> None:
+    """Draw one run's progress, counters, and log.
+
+    The worker owns the run, so this is only a reader: closing the tab or
+    reopening the dashboard later reattaches to the same status file.
     """
-    status = active_status() or (
-        read_status(st.session_state.run_id)
-        if st.session_state.get("run_id")
-        else None
-    ) or latest_status()
-    if not status:
-        return
-
     state = str(status.get("state") or "")
     running = state in ACTIVE_STATES
     label = {
@@ -380,13 +385,29 @@ def run_panel() -> None:
             text=str(status.get("message") or ""),
         )
         st.caption(
-            f"Run `{status.get('run_id', '')}` started {status.get('started_at', '')}"
-            " (UTC). This run continues on the server if you close this tab."
+            f"Run `{status.get('run_id', '')}` started "
+            f"{status.get('started_at', '')} (UTC). It keeps running on the "
+            "server if you close this tab."
         )
-        if running:
-            if st.button("Stop this run", icon=":material/stop_circle:"):
-                request_stop(str(status["run_id"]))
-                st.rerun()
+        if running and st.button(
+            "Stop this run",
+            icon=":material/stop_circle:",
+        ):
+            request_stop(str(status["run_id"]))
+            st.rerun(scope="app")
+
+        log_tail = read_log(str(status.get("run_id", "")), lines=300)
+        with st.expander("Run log", expanded=bool(status.get("error"))):
+            if log_tail:
+                st.code(log_tail, language="log", height=320)
+                st.download_button(
+                    "Download this log",
+                    log_tail,
+                    file_name=f"{status.get('run_id', 'run')}.log",
+                    icon=":material/download:",
+                )
+            else:
+                st.caption("The worker has not written any output yet.")
         if status.get("error"):
             st.error(status["error"])
         if status.get("database_error"):
@@ -401,28 +422,43 @@ def run_panel() -> None:
                 icon=":material/database:",
             )
 
-    if running:
-        # Cheap poll: the worker rewrites the status file as it progresses.
-        time.sleep(3)
-        st.rerun()
-    elif state in {"success", "incomplete", "stopped"}:
+
+@st.fragment(run_every=3)
+def live_run_panel() -> None:
+    """Refresh only this box while the worker is busy.
+
+    Rerunning the whole page every few seconds would reload the catalogue and
+    never let the script settle.
+    """
+    status = current_status()
+    if not status:
+        return
+    render_run(status)
+    if str(status.get("state")) not in ACTIVE_STATES:
+        # The run just finished: refresh the page once to pick up its rows.
+        st.rerun(scope="app")
+
+
+run_status = current_status()
+if run_status:
+    if str(run_status.get("state")) in ACTIVE_STATES:
+        live_run_panel()
+    else:
+        render_run(run_status)
         st.session_state.last_run = {
-            "site": status.get("site", ""),
-            "completed": bool(status.get("completed")),
-            "next_page": status.get("next_page"),
-            "stop_reasons": list(status.get("stop_reasons", ())),
-            "products_written": int(status.get("products_written", 0)),
-            "excel_path": status.get("excel_path", ""),
-            "csv_path": status.get("csv_path", ""),
-            "failures": status.get("failures", 0),
-            "blocks": status.get("blocks", 0),
-            "requests": status.get("requests", 0),
-            "listing_products": status.get("listing_products", 0),
-            "detail_parents": status.get("detail_parents", 0),
+            "site": run_status.get("site", ""),
+            "completed": bool(run_status.get("completed")),
+            "next_page": run_status.get("next_page"),
+            "stop_reasons": list(run_status.get("stop_reasons", ())),
+            "products_written": int(run_status.get("products_written", 0)),
+            "excel_path": run_status.get("excel_path", ""),
+            "csv_path": run_status.get("csv_path", ""),
+            "failures": run_status.get("failures", 0),
+            "blocks": run_status.get("blocks", 0),
+            "requests": run_status.get("requests", 0),
+            "listing_products": run_status.get("listing_products", 0),
+            "detail_parents": run_status.get("detail_parents", 0),
         }
-
-
-run_panel()
 
 if st.session_state.dashboard_error:
     st.error(st.session_state.dashboard_error)
