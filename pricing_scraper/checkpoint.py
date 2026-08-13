@@ -47,6 +47,51 @@ def _append_text_durable(path: Path, text: str) -> None:
         os.fsync(handle.fileno())
 
 
+def _replace_text_durable(path: Path, text: str) -> None:
+    """Atomically replace a small state file, flushed to disk before renaming.
+
+    Writing the temporary file and renaming it is only half of an atomic
+    replace. Without an fsync the rename can reach the disk while the contents
+    are still in the operating system's cache, and a crash or power loss then
+    leaves a file of the right length filled with NUL bytes - which is exactly
+    how a checkpoint becomes unreadable.
+    """
+    temporary = path.with_name(f"{path.name}.tmp")
+    payload = text.encode("utf-8")
+    with temporary.open("wb", buffering=0) as handle:
+        handle.write(payload)
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _quarantine(path: Path, reason: str, label: str) -> None:
+    """Move an unusable checkpoint file aside so the next run can rebuild it.
+
+    The damaged file is kept rather than deleted: it is the only evidence of
+    what went wrong, and the rebuilt state is derived from the append-only
+    files next to it.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    damaged = path.with_name(f"{path.name}.corrupt-{stamp}")
+    try:
+        os.replace(path, damaged)
+    except OSError as exc:
+        LOGGER.error(
+            "checkpoint_quarantine_failed label=%s path=%s error=%s",
+            label,
+            path,
+            exc,
+        )
+        return
+    LOGGER.warning(
+        "checkpoint_state_rebuilt label=%s path=%s reason=%s moved_to=%s",
+        label,
+        path,
+        reason,
+        damaged.name,
+    )
+
+
 def _load_jsonl_products(path: Path, label: str) -> list[Product]:
     """Load valid product rows while isolating interrupted final writes."""
     if not path.exists():
@@ -110,19 +155,34 @@ class CheckpointStore:
         self.start_page = max(1, int(start_page))
 
     def load_state(self) -> CheckpointState:
-        """Load state, returning a fresh checkpoint when no state exists."""
+        """Load state, returning a fresh checkpoint when no state exists.
+
+        A state file damaged by an interrupted write is quarantined and the
+        category restarts at its first page. The saved pages themselves live in
+        the append-only products file, so nothing collected is lost: already
+        seen product IDs are passed back to the client and the export
+        deduplicates. Refusing to run instead would leave the retailer
+        permanently unscrapeable until somebody deleted the file by hand.
+        """
         if not self.state_path.exists():
             return CheckpointState(next_page=self.start_page)
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(
-                f"Checkpoint state is unreadable: {self.state_path}"
-            ) from exc
+            _quarantine(self.state_path, str(exc), "listing")
+            return CheckpointState(next_page=self.start_page)
         if not isinstance(payload, Mapping):
-            raise ValueError(
-                f"Checkpoint state must contain a JSON object: {self.state_path}"
+            _quarantine(
+                self.state_path, "state is not a JSON object", "listing"
             )
+            return CheckpointState(next_page=self.start_page)
+        try:
+            return self._state_from(payload)
+        except (TypeError, ValueError) as exc:
+            _quarantine(self.state_path, str(exc), "listing")
+            return CheckpointState(next_page=self.start_page)
+
+    def _state_from(self, payload: Mapping[str, Any]) -> CheckpointState:
         return CheckpointState(
             next_page=max(
                 self.start_page,
@@ -197,12 +257,10 @@ class CheckpointStore:
         return state
 
     def _write_state(self, state: CheckpointState) -> None:
-        temporary = self.state_path.with_suffix(".state.tmp")
-        temporary.write_text(
+        _replace_text_durable(
+            self.state_path,
             json.dumps(asdict(state), indent=2, ensure_ascii=False),
-            encoding="utf-8",
         )
-        temporary.replace(self.state_path)
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,19 +296,49 @@ class DetailCheckpointStore:
         self.state_path = self.directory / f"{stem}.state.json"
 
     def load_state(self) -> DetailCheckpointState:
-        """Load the enrichment state or return a fresh state."""
+        """Load the enrichment state, rebuilding it when the file is damaged.
+
+        This state is pure bookkeeping: the parents already enriched are listed
+        in the append-only processed file and their rows in the products file.
+        A state file lost to an interrupted write is therefore quarantined and
+        recomputed from those two, so a run resumes exactly where it stopped
+        instead of failing before it starts.
+        """
         if not self.state_path.exists():
             return DetailCheckpointState()
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(
-                f"Detail checkpoint is unreadable: {self.state_path}"
-            ) from exc
+            _quarantine(self.state_path, str(exc), "details")
+            return self._rebuilt_state()
         if not isinstance(payload, Mapping):
-            raise ValueError(
-                f"Detail checkpoint must be a JSON object: {self.state_path}"
+            _quarantine(
+                self.state_path, "state is not a JSON object", "details"
             )
+            return self._rebuilt_state()
+        try:
+            return self._state_from(payload)
+        except (TypeError, ValueError) as exc:
+            _quarantine(self.state_path, str(exc), "details")
+            return self._rebuilt_state()
+
+    def _rebuilt_state(self) -> DetailCheckpointState:
+        """Recompute enrichment counters from the append-only checkpoint files.
+
+        ``completed`` is deliberately left false: the products file cannot say
+        whether every discovered parent was reached, so the next run rechecks
+        and marks completion itself.
+        """
+        state = DetailCheckpointState(
+            completed=False,
+            parents_processed=len(self.load_processed_ids()),
+            products_saved=len(self.load_products()),
+            updated_at=_utc_now(),
+        )
+        self._write_state(state)
+        return state
+
+    def _state_from(self, payload: Mapping[str, Any]) -> DetailCheckpointState:
         return DetailCheckpointState(
             completed=bool(payload.get("completed", False)),
             parents_processed=max(
@@ -329,9 +417,7 @@ class DetailCheckpointStore:
         return state
 
     def _write_state(self, state: DetailCheckpointState) -> None:
-        temporary = self.state_path.with_suffix(".state.tmp")
-        temporary.write_text(
+        _replace_text_durable(
+            self.state_path,
             json.dumps(asdict(state), indent=2, ensure_ascii=False),
-            encoding="utf-8",
         )
-        temporary.replace(self.state_path)

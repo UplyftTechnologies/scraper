@@ -21,9 +21,6 @@ from pricing_scraper.config import (
 from pricing_scraper.dashboard_service import (
     AMAZON_UNAVAILABLE_MESSAGE,
     amazon_dependencies_available,
-    collect_amazon,
-    collect_nykaa,
-    collect_tira,
 )
 from pricing_scraper.background import (
     ACTIVE_STATES,
@@ -35,7 +32,6 @@ from pricing_scraper.background import (
     request_stop,
     start_run,
 )
-from pricing_scraper.exporter import load_products_csv
 
 st.set_page_config(
     page_title="Beauty pricing dashboard",
@@ -159,6 +155,7 @@ st.session_state.setdefault("products", [])
 st.session_state.setdefault("last_run", {})
 st.session_state.setdefault("dashboard_error", "")
 st.session_state.setdefault("run_id", "")
+st.session_state.setdefault("manual_result", None)
 
 st.title("Beauty pricing dashboard")
 st.caption(
@@ -178,12 +175,13 @@ amazon_available = amazon_dependencies_available()
 
 with st.sidebar:
     st.header("Collection settings")
-    st.caption(f"Config: `{config_path}`")
     brand_filter = list(config.get("brands") or ())
     if brand_filter:
-        st.caption(
-            f"Brands (SCRAPE_BRANDS): {', '.join(brand_filter)}"
-        )
+        # The full list runs to a couple of hundred names, which pushed every
+        # control below it off the screen. Keep the count visible and the
+        # names one click away.
+        with st.expander(f"Brands: {len(brand_filter)} (SCRAPE_BRANDS)"):
+            st.caption(", ".join(brand_filter))
     else:
         st.caption("Brands: all (set SCRAPE_BRANDS in .env to narrow)")
     retailer = st.selectbox(
@@ -208,13 +206,11 @@ with st.sidebar:
     ]
     category_names = [str(item["name"]) for item in category_records]
     configured_page_limit = int(config[site_key].get("page_limit", 2))
-    all_category = ""
-    default_categories = category_names
     with st.form(f"{site_key}_collection_form"):
         selected_categories = st.multiselect(
             "Categories",
             options=category_names,
-            default=default_categories,
+            default=category_names,
             help=(
                 "Only the approved comparison taxonomy is listed. Products "
                 "found in multiple selections retain every category label."
@@ -272,65 +268,159 @@ with st.sidebar:
             ),
             disabled=site_key == "amazon",
         )
+        skip_current = st.checkbox(
+            "Skip products already up to date",
+            value=True,
+            help=(
+                "Compares each product against the stored catalogue (Supabase "
+                "when configured, otherwise the saved CSV) and requests it "
+                "only when it is new, when the listing shows it changed, when "
+                "its stored record is missing content, or when that record is "
+                "older than the refresh window. Uncheck to re-request "
+                "everything."
+            ),
+        )
         submitted = st.form_submit_button(
             "Collect latest prices",
             type="primary",
             icon=":material/refresh:",
             width="stretch",
         )
-    if site_key == "nykaa":
-        st.caption(
-            "Private Nykaa cURL headers remain on this computer and are never "
-            "displayed in the dashboard."
+    with st.form(f"{site_key}_gtin_form"):
+        st.caption("Barcodes only — fills empty `gtin`, changes nothing else.")
+        gtin_all = st.checkbox(
+            "Also re-read barcodes already stored",
+            value=False,
+            help="By default only products with an empty gtin are requested.",
         )
-    elif site_key == "tira":
-        st.caption(
-            "Tira uses public JSON services used by its storefront; rendered "
-            "product HTML is not scraped."
+        gtin_limit = st.number_input(
+            "Product cap (0 = no cap)",
+            min_value=0,
+            max_value=100000,
+            value=0,
+            step=100,
+            help=(
+                "Tira reads barcodes from its listing, so a cap has no effect "
+                "there. Nykaa costs one request per parent and Amazon one page "
+                "per product."
+            ),
         )
-    else:
-        st.caption(
-            "Amazon uses Playwright with a fresh browser context on retries. "
-            "CAPTCHA pages are screenshotted to logs and remain pending."
+        gtin_submitted = st.form_submit_button(
+            "Collect GTINs only",
+            icon=":material/barcode_scanner:",
+            width="stretch",
         )
-    st.caption(
-        "Large catalogue runs can take several hours due to rate limits. "
-        "Listing pages and detail/variant requests are checkpointed. The run "
-        "continues on the server after you close this tab; reopen the "
-        "dashboard to see its progress."
+    st.divider()
+    st.subheader("Insert products from a sheet")
+    st.caption("Inserts only rows Supabase does not already have.")
+    upload = st.file_uploader(
+        "Product sheet",
+        type=("csv", "xlsx", "xlsm"),
+        help=(
+            "Needs a brand and a product name; site, product_id, sku, gtin, "
+            "mrp, selling_price, variant, categories and URLs are optional. "
+            "Headers are matched by name, so a Shopify or marketplace export "
+            "works unedited."
+        ),
     )
+    manual_site = st.text_input(
+        "Site for rows that do not name one",
+        value="manual",
+        help=(
+            "Kept separate from nykaa/tira/amazon on purpose: a retailer sweep "
+            "replaces that retailer's rows and ages the ones it did not see, "
+            "which would delete hand-added products."
+        ),
+    )
+    check_column, insert_column = st.columns(2)
+    with check_column:
+        check_clicked = st.button(
+            "Check only",
+            icon=":material/search:",
+            width="stretch",
+            disabled=upload is None,
+        )
+    with insert_column:
+        insert_clicked = st.button(
+            "Insert",
+            type="primary",
+            icon=":material/database_upload:",
+            width="stretch",
+            disabled=upload is None,
+        )
+    if upload is not None and (check_clicked or insert_clicked):
+        from pricing_scraper.manual import insert_manual_products
+
+        try:
+            outcome = insert_manual_products(
+                upload.getvalue(),
+                filename=upload.name,
+                default_site=str(manual_site).casefold().strip() or "manual",
+                dry_run=check_clicked,
+            )
+            st.session_state.manual_result = {
+                "summary": outcome.summary(),
+                "inserted": [
+                    f"{item.site} · {item.brand} · {item.product_name}"
+                    for item in outcome.inserted
+                ],
+                "skipped": [
+                    f"{item.brand} · {item.product_name} ({reason})"
+                    for item, reason in outcome.skipped_existing
+                ],
+                "rejected": [f"row {line}: {why}" for line, why in outcome.rejected],
+                "retailer_sites": sorted(outcome.retailer_sites),
+                "written": outcome.written,
+                "checked_only": check_clicked,
+            }
+        except Exception as exc:
+            st.session_state.manual_result = {"error": str(exc)}
+
+    st.caption("Runs continue after you close this tab.")
+
+def begin(request: RunRequest) -> None:
+    """Start a worker and reattach the dashboard to it."""
+    st.session_state.dashboard_error = ""
+    try:
+        started = start_run(request)
+        st.session_state.run_id = started["run_id"]
+        st.session_state.products = []
+        st.session_state.last_run = {}
+    except Exception as exc:
+        st.session_state.dashboard_error = str(exc)
+    st.rerun()
+
 
 if submitted:
     if not selected_categories:
         st.session_state.dashboard_error = "Select at least one category."
-    elif (
-        all_category
-        and all_category in selected_categories
-        and len(selected_categories) > 1
-    ):
-        st.session_state.dashboard_error = (
-            f"Select {all_category} by itself, or select individual child "
-            f"categories without {all_category}."
-        )
     else:
-        st.session_state.dashboard_error = ""
-        try:
-            started = start_run(
-                RunRequest(
-                    site=site_key,
-                    categories=list(selected_categories),
-                    page_limit=int(page_limit),
-                    resume=bool(resume_run),
-                    enrich_details=bool(enrich_details),
-                    config_path=str(config_path),
-                )
+        begin(
+            RunRequest(
+                site=site_key,
+                categories=list(selected_categories),
+                page_limit=int(page_limit),
+                resume=bool(resume_run),
+                enrich_details=bool(enrich_details),
+                refresh_only_stale=bool(skip_current),
+                config_path=str(config_path),
             )
-            st.session_state.run_id = started["run_id"]
-            st.session_state.products = []
-            st.session_state.last_run = {}
-        except Exception as exc:
-            st.session_state.dashboard_error = str(exc)
-        st.rerun()
+        )
+
+if gtin_submitted:
+    begin(
+        RunRequest(
+            site=site_key,
+            categories=list(selected_categories),
+            page_limit=int(page_limit),
+            resume=True,
+            enrich_details=False,
+            mode="gtin",
+            gtin_all=bool(gtin_all),
+            gtin_limit=int(gtin_limit),
+            config_path=str(config_path),
+        )
+    )
 
 
 def current_status() -> dict[str, Any] | None:
@@ -389,12 +479,24 @@ def render_run(status: dict[str, Any]) -> None:
             f"{status.get('started_at', '')} (UTC). It keeps running on the "
             "server if you close this tab."
         )
-        if running and st.button(
-            "Stop this run",
-            icon=":material/stop_circle:",
-        ):
-            request_stop(str(status["run_id"]))
-            st.rerun(scope="app")
+        if running:
+            requested_at = str(status.get("stop_requested_at") or "")
+            if requested_at:
+                # A stop lands at the next progress checkpoint, so say that
+                # plainly instead of leaving the button looking unresponsive.
+                st.caption(
+                    f"Stop requested at {requested_at} (UTC). The worker stops "
+                    "once the request in flight returns, and the checkpoint is "
+                    "kept. If nothing changes, the run log shows what it is "
+                    "waiting for."
+                )
+            if st.button(
+                "Stop this run",
+                icon=":material/stop_circle:",
+                disabled=bool(requested_at),
+            ):
+                request_stop(str(status["run_id"]))
+                st.rerun(scope="app")
 
         log_tail = read_log(str(status.get("run_id", "")), lines=300)
         with st.expander("Run log", expanded=bool(status.get("error"))):
@@ -462,6 +564,56 @@ if run_status:
 
 if st.session_state.dashboard_error:
     st.error(st.session_state.dashboard_error)
+
+manual_result = st.session_state.get("manual_result")
+if manual_result:
+    with st.container(border=True):
+        st.subheader("Sheet import")
+        if manual_result.get("error"):
+            st.error(manual_result["error"])
+        else:
+            summary = manual_result["summary"]
+            if manual_result["checked_only"]:
+                st.info(f"{summary} — nothing was written.", icon=":material/search:")
+            elif manual_result["written"]:
+                st.success(
+                    f"{summary} — inserted into Supabase.",
+                    icon=":material/database:",
+                )
+            else:
+                st.info(
+                    f"{summary} — nothing new, so nothing was inserted.",
+                    icon=":material/info:",
+                )
+            if manual_result["retailer_sites"]:
+                st.warning(
+                    "Rows were filed under "
+                    f"{', '.join(manual_result['retailer_sites'])}. The next "
+                    "run of that retailer replaces its rows and ages the ones "
+                    "it does not see, which will remove these. Leave the site "
+                    "column blank to keep them separate.",
+                    icon=":material/warning:",
+                )
+            verb = "Would insert" if manual_result["checked_only"] else "Inserted"
+            for label, items in (
+                (f"{verb} ({len(manual_result['inserted'])})", manual_result["inserted"]),
+                (
+                    f"Already in Supabase ({len(manual_result['skipped'])})",
+                    manual_result["skipped"],
+                ),
+                (
+                    f"Unusable rows ({len(manual_result['rejected'])})",
+                    manual_result["rejected"],
+                ),
+            ):
+                if items:
+                    with st.expander(label):
+                        st.write("\n".join(f"- {line}" for line in items[:200]))
+                        if len(items) > 200:
+                            st.caption(f"...and {len(items) - 200} more")
+    if st.button("Dismiss", icon=":material/close:"):
+        st.session_state.manual_result = None
+        st.rerun()
 
 frame = products_dataframe(st.session_state.products)
 if frame.empty:
@@ -557,59 +709,60 @@ filtered = (
     else filtered.iloc[0:0].copy()
 )
 
-chart_column, download_column = st.columns([2, 1])
-with chart_column:
-    with st.container(border=True):
-        st.subheader("Products by brand")
-        brand_counts = (
-            filtered.groupby("brand", as_index=False)
-            .size()
-            .rename(columns={"size": "Products"})
-            .sort_values("Products", ascending=False)
-        )
-        st.bar_chart(
-            brand_counts,
-            x="brand",
-            y="Products",
-            x_label="Brand",
-            y_label="Products",
-        )
+# chart_column, download_column = st.columns([2, 1])
+# with chart_column:
+#     with st.container(border=True):
+#         st.subheader("Products by brand")
+#         brand_counts = (
+#             filtered.groupby("brand", as_index=False)
+#             .size()
+#             .rename(columns={"size": "Products"})
+#             .sort_values("Products", ascending=False)
+#         )
+#         st.bar_chart(
+#             brand_counts,
+#             x="brand",
+#             y="Products",
+#             x_label="Brand",
+#             y_label="Products",
+#         )
 
-with download_column:
-    with st.container(border=True):
-        st.subheader("Download catalogue")
-        excel_path = Path(
-            str(last_run.get("excel_path") or config["output"]["excel_path"])
+# The "Products by brand" chart above is commented out, which took the
+# column layout with it, so the download panel stands on its own.
+with st.container(border=True):
+    st.subheader("Download catalogue")
+    excel_path = Path(
+        str(last_run.get("excel_path") or config["output"]["excel_path"])
+    )
+    csv_path = Path(
+        str(
+            last_run.get("csv_path")
+            or config["output"]["combined_csv_path"]
         )
-        csv_path = Path(
-            str(
-                last_run.get("csv_path")
-                or config["output"]["combined_csv_path"]
-            )
+    )
+    if excel_path.exists():
+        st.download_button(
+            "Download Excel",
+            data=excel_path.read_bytes(),
+            file_name=excel_path.name,
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
+            ),
+            icon=":material/download:",
+            on_click="ignore",
+            width="stretch",
         )
-        if excel_path.exists():
-            st.download_button(
-                "Download Excel",
-                data=excel_path.read_bytes(),
-                file_name=excel_path.name,
-                mime=(
-                    "application/vnd.openxmlformats-officedocument."
-                    "spreadsheetml.sheet"
-                ),
-                icon=":material/download:",
-                on_click="ignore",
-                width="stretch",
-            )
-        if csv_path.exists():
-            st.download_button(
-                "Download CSV",
-                data=csv_path.read_bytes(),
-                file_name=csv_path.name,
-                mime="text/csv",
-                icon=":material/download:",
-                on_click="ignore",
-                width="stretch",
-            )
+    if csv_path.exists():
+        st.download_button(
+            "Download CSV",
+            data=csv_path.read_bytes(),
+            file_name=csv_path.name,
+            mime="text/csv",
+            icon=":material/download:",
+            on_click="ignore",
+            width="stretch",
+        )
 
 with st.container(border=True):
     st.subheader("Product catalogue")

@@ -10,6 +10,7 @@ from pricing_scraper.exporter import (
     OUTPUT_COLUMNS,
     deduplicate,
     export_products,
+    load_products_csv,
     merge_with_existing_sites,
 )
 from pricing_scraper.database import DatabaseSyncResult
@@ -117,7 +118,7 @@ class ExporterTests(unittest.TestCase):
                 {("nykaa", "nykaa-1"), ("tira", "tira-2")},
             )
 
-    def test_database_sync_runs_before_file_export_status(self):
+    def test_files_are_written_before_the_database_is_synchronized(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             statuses = []
@@ -139,8 +140,75 @@ class ExporterTests(unittest.TestCase):
 
         sync.assert_called_once()
         self.assertEqual(result.database_products_written, 1)
-        self.assertIn("Supabase", statuses[0])
-        self.assertIn("Excel and CSV", statuses[1])
+        self.assertIn("Excel and CSV", statuses[0])
+        self.assertIn("Supabase", statuses[1])
+
+    def test_a_failed_required_sync_still_leaves_the_export_on_disk(self):
+        """A Supabase outage must not discard a collection that already ran.
+
+        DATABASE_SYNC_REQUIRED still stops the run being reported complete, but
+        the workbook and CSV are the durable record of hours of rate-limited
+        requests and have to survive a network failure at the very last step.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            excel_path = root / "pricing.xlsx"
+            csv_path = root / "pricing.csv"
+            with patch(
+                "pricing_scraper.exporter.sync_products_to_database",
+                side_effect=ConnectionError("The write operation timed out"),
+            ):
+                with self.assertRaises(ConnectionError):
+                    export_products(
+                        [product("1")],
+                        excel_path,
+                        csv_path,
+                        sync_database=True,
+                    )
+
+            self.assertTrue(excel_path.exists())
+            self.assertTrue(csv_path.exists())
+            self.assertEqual(
+                [item.product_id for item in load_products_csv(csv_path)],
+                ["1"],
+            )
+
+
+class HostedExportTests(unittest.TestCase):
+    """A small hosted container cannot afford the workbook, and does not need it."""
+
+    def test_skipping_excel_still_writes_the_csv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            excel_path = root / "pricing.xlsx"
+            csv_path = root / "pricing.csv"
+
+            result = export_products(
+                [product("1")], excel_path, csv_path, write_excel=False
+            )
+
+            self.assertFalse(excel_path.exists())
+            self.assertTrue(csv_path.exists())
+            self.assertEqual(
+                [item.product_id for item in load_products_csv(csv_path)], ["1"]
+            )
+            self.assertEqual(result.products_written, 1)
+
+    def test_the_workbook_is_built_by_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            excel_path = root / "pricing.xlsx"
+            export_products([product("1")], excel_path, root / "pricing.csv")
+            self.assertTrue(excel_path.exists())
+
+    def test_no_temporary_files_are_left_behind(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            export_products(
+                [product("1")], root / "pricing.xlsx", root / "pricing.csv",
+                write_excel=False,
+            )
+            self.assertEqual([p.name for p in root.glob(".*tmp*")], [])
 
 
 if __name__ == "__main__":

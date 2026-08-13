@@ -5,10 +5,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
+import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from pricing_scraper.checkpoint import CheckpointStore, DetailCheckpointStore
 from pricing_scraper.clients.base import ConfigurationError, RequestFailed
@@ -20,7 +22,18 @@ from pricing_scraper.exporter import (
     export_products,
     merge_with_existing_sites,
 )
+from pricing_scraper.db_sink import open_sink
 from pricing_scraper.models import Product
+from pricing_scraper.refresh import (
+    RefreshPlan,
+    RefreshPolicy,
+    build_plan,
+    decide,
+    load_known_products,
+    plan_for_site,
+)
+
+LOGGER = logging.getLogger("pricing_scraper.dashboard_service")
 
 ProgressCallback = Callable[[str, int, int, str], None]
 
@@ -56,6 +69,71 @@ def _database_sync_enabled(config: dict[str, Any]) -> bool:
     )
 
 
+def hosted_deployment() -> bool:
+    """Whether this process is the hosted container rather than a local run."""
+    return os.getenv("HOSTED_DASHBOARD", "").strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _write_excel_here() -> bool:
+    """Build the workbook locally, skip it on the hosted container.
+
+    The workbook holds every cell in memory and peaks near 500 MB for a large
+    catalogue, which a small instance cannot afford. It is also written to a
+    temporary disk there, so it would not survive the next restart. Hosted runs
+    keep the CSV and rely on the database.
+    """
+    return not hosted_deployment()
+
+
+def _open_run_sink(
+    site: str,
+    run_config: dict[str, Any],
+) -> tuple[Any, str]:
+    """Open a streaming database sink and register the run, when configured."""
+    if not _database_sync_enabled(run_config):
+        return None, ""
+    run_id = ""
+    try:
+        from pricing_scraper.database import SupabaseCatalogStore
+
+        store, _required = SupabaseCatalogStore.from_environment()
+        if store is not None:
+            run_id = store.start_run(
+                site, metadata={"mode": "dashboard", "streaming": True}
+            )
+    except Exception as exc:  # noqa: BLE001 - bookkeeping must not block a run
+        LOGGER.info("Could not register the run in the database (%s).", exc)
+    sink = open_sink(site, enabled=True, run_id=run_id)
+    return sink, run_id
+
+
+def _close_sink(sink: Any, *, complete_sweep: bool) -> Any:
+    """Flush the tail of the stream and age missing products when appropriate."""
+    if sink is None:
+        return None
+    return sink.close(complete_sweep=complete_sweep)
+
+
+def _needs_final_sync(run_config: dict[str, Any], sink: Any) -> bool:
+    """Whether the export still has to push the whole catalogue.
+
+    When streaming worked there is nothing left to send: every product already
+    went up in batches as it was scraped. A failed batch is the exception - the
+    full sync then acts as the reconciliation pass, which is worth its cost
+    precisely because something was missed.
+    """
+    if not _database_sync_enabled(run_config):
+        return False
+    if sink is None:
+        return True
+    return sink.result.failures > 0
+
+
 def _parent_id(product: Product) -> str:
     if product.parent_product_id:
         return product.parent_product_id
@@ -69,6 +147,18 @@ def _permanent_detail_not_found(exc: Exception) -> bool:
         isinstance(exc, RequestFailed)
         and exc.status_code in {404, 410}
     )
+
+
+def _sleeper_kwargs(
+    sleeper: Callable[[float], None] | None,
+) -> dict[str, Callable[[float], None]]:
+    """Pass a sleeper to a client only when the caller supplied one.
+
+    The background worker supplies one that raises when the dashboard asks the
+    run to stop, so a request waiting out a backoff does not have to finish
+    before the stop takes effect. Direct callers keep ``time.sleep``.
+    """
+    return {"sleeper": sleeper} if sleeper is not None else {}
 
 
 def _export_status_callback(
@@ -95,18 +185,14 @@ class CollectionResult:
     completed: bool
     next_page: int | None
     stop_reasons: tuple[str, ...]
-    resumed_products: int
-    checkpoint_paths: tuple[Path, ...]
     listing_products: int
     detail_parents: int
 
 
 def _full_catalog_partitions(
-    client: NykaaClient,
     selected: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Expand the all-skincare scope into smaller API result windows."""
-    del client
     expanded: list[dict[str, Any]] = []
     for category in selected:
         partitions = category.get("partitions")
@@ -132,6 +218,84 @@ def _full_catalog_partitions(
             item["partitions"] = []
             expanded.append(item)
     return expanded or selected
+
+
+@dataclass(frozen=True, slots=True)
+class _ReuseResult:
+    """What a refresh check let this run skip."""
+
+    parent_ids: set[str]
+    product_ids: set[str]
+    plan: RefreshPlan | None
+
+
+def _reuse_current_details(
+    *,
+    site: str,
+    representatives: Mapping[str, Product],
+    listing_products: Sequence[Product],
+    detail_store: DetailCheckpointStore,
+    processed_before: set[str],
+    policy: RefreshPolicy,
+    csv_path: Path | None,
+    use_database: bool,
+    parent_of: Callable[[Product], str],
+) -> _ReuseResult:
+    """Commit stored detail for products that do not need requesting again.
+
+    A parent is only reused when every SKU beneath it is current: one changed
+    size means the whole detail response is worth fetching, because that is the
+    unit the retailer returns.
+
+    The stored rows are appended to the detail checkpoint exactly as a real
+    fetch would, so completion, export, and resume logic need no special case.
+    """
+    empty = _ReuseResult(set(), set(), None)
+    if not policy.enabled or not representatives:
+        return empty
+
+    plan = plan_for_site(
+        site,
+        list(listing_products),
+        policy=policy,
+        csv_path=csv_path,
+        use_database=use_database,
+    )
+    if not plan.known:
+        return _ReuseResult(set(), set(), plan)
+
+    stored = plan.stored_products()
+    by_parent: dict[str, list[Product]] = {}
+    for product in stored.values():
+        by_parent.setdefault(parent_of(product), []).append(product)
+
+    # A parent needs work when any of its discovered SKUs does.
+    needs_parent: set[str] = set()
+    for product in listing_products:
+        if plan.needs(product.product_id):
+            needs_parent.add(parent_of(product))
+
+    parent_ids: set[str] = set()
+    product_ids: set[str] = set()
+    for parent_id in representatives:
+        if parent_id in processed_before or parent_id in needs_parent:
+            continue
+        rows = by_parent.get(parent_id)
+        if not rows:
+            # Nothing stored to reuse, so it still has to be requested.
+            continue
+        detail_store.append_parent(parent_id, rows)
+        parent_ids.add(parent_id)
+        product_ids.update(row.product_id for row in rows)
+    if parent_ids:
+        LOGGER.info(
+            "refresh_reused site=%s parents=%s rows=%s source=%s",
+            site,
+            len(parent_ids),
+            len(product_ids),
+            plan.source,
+        )
+    return _ReuseResult(parent_ids, product_ids, plan)
 
 
 def _scope_id(categories: Iterable[dict[str, Any]]) -> str:
@@ -166,11 +330,15 @@ def collect_nykaa(
     *,
     resume: bool = True,
     enrich_details: bool | None = None,
+    refresh_only_stale: bool | None = None,
     progress_callback: ProgressCallback | None = None,
+    sleeper: Callable[[float], None] | None = None,
 ) -> CollectionResult:
     """Collect Nykaa listings and optionally enrich every parent/SKU detail."""
     run_config = copy.deepcopy(config)
+    refresh_policy = RefreshPolicy.from_config(run_config, enabled=refresh_only_stale)
     run_config["nykaa"]["page_limit"] = max(1, int(page_limit))
+    sink, _run_id = _open_run_sink("nykaa", run_config)
     detail_config = run_config["nykaa"].get("details", {})
     detail_config = detail_config if isinstance(detail_config, dict) else {}
     details_enabled = (
@@ -183,9 +351,10 @@ def collect_nykaa(
         site_config=run_config["nykaa"],
         request_config=run_config["request"],
         brands=run_config.get("brands", ()),
+        **_sleeper_kwargs(sleeper),
     ) as client:
         requested = client.select_categories(list(categories))
-        selected = _full_catalog_partitions(client, requested)
+        selected = _full_catalog_partitions(requested)
         checkpoint_dir = Path(
             str(
                 run_config["nykaa"].get("checkpoint_dir")
@@ -243,9 +412,6 @@ def collect_nykaa(
             for products in previous_by_checkpoint.values()
             for product in products
         }
-        resumed_products = sum(
-            len(products) for products in previous_by_checkpoint.values()
-        )
         listing_completed = True
 
         if progress_callback is not None:
@@ -287,6 +453,8 @@ def collect_nykaa(
                 ) -> None:
                     saved_products = list(page_products)
                     current_store.append_page(page, saved_products)
+                    if sink is not None:
+                        sink.add(saved_products)
                     live_listing_ids.update(
                         product.product_id for product in saved_products
                     )
@@ -376,12 +544,37 @@ def collect_nykaa(
                 product.product_id for product in enriched_before
             }
             processed_live = set(processed_before)
-            resumed_products += len(enriched_before)
+
+            # Reuse the stored detail for parents that are complete and
+            # current, committing it to the checkpoint as though it had just
+            # been fetched. Everything downstream then behaves identically to a
+            # full run, minus the requests.
+            reused = _reuse_current_details(
+                site="nykaa",
+                representatives=representatives,
+                listing_products=listing_products,
+                detail_store=detail_store,
+                processed_before=processed_before,
+                policy=refresh_policy,
+                csv_path=_output_paths(run_config, output_path)[1],
+                use_database=_database_sync_enabled(run_config),
+                parent_of=_parent_id,
+            )
+            processed_live |= reused.parent_ids
+            live_sku_ids |= reused.product_ids
             pending = [
                 (parent_id, product)
                 for parent_id, product in representatives.items()
                 if parent_id not in processed_before
+                and parent_id not in reused.parent_ids
             ]
+            if reused.plan is not None and progress_callback is not None:
+                progress_callback(
+                    "details",
+                    len(processed_live),
+                    detail_parent_count,
+                    f"Refresh check: {reused.plan.summary()}",
+                )
             detail_failures_before = client.detail_failures
 
             if progress_callback is not None:
@@ -405,6 +598,8 @@ def collect_nykaa(
                 try:
                     detail_products = client.fetch_product_details(product)
                     detail_store.append_parent(parent_id, detail_products)
+                    if sink is not None:
+                        sink.add(detail_products)
                     processed_live.add(parent_id)
                     live_sku_ids.update(
                         item.product_id for item in detail_products
@@ -492,11 +687,13 @@ def collect_nykaa(
             csv_path,
             replacing_site="nykaa",
         )
+        _close_sink(sink, complete_sweep=completed)
         export = export_products(
             combined_products,
             excel_path,
             csv_path,
-            sync_database=_database_sync_enabled(run_config),
+            sync_database=_needs_final_sync(run_config, sink),
+            write_excel=_write_excel_here(),
             status_callback=_export_status_callback(progress_callback),
         )
         return CollectionResult(
@@ -513,14 +710,6 @@ def collect_nykaa(
             completed=completed,
             next_page=next_page,
             stop_reasons=tuple(dict.fromkeys(stop_reasons)),
-            resumed_products=resumed_products,
-            checkpoint_paths=tuple(
-                [
-                    store.state_path
-                    for store in listing_stores.values()
-                ]
-                + [detail_store.state_path]
-            ),
             listing_products=len(listing_products),
             detail_parents=detail_parent_count,
         )
@@ -539,11 +728,15 @@ def collect_tira(
     *,
     resume: bool = True,
     enrich_details: bool | None = None,
+    refresh_only_stale: bool | None = None,
     progress_callback: ProgressCallback | None = None,
+    sleeper: Callable[[float], None] | None = None,
 ) -> CollectionResult:
     """Collect Tira catalogue rows and enrich each variant's current price."""
     run_config = copy.deepcopy(config)
+    refresh_policy = RefreshPolicy.from_config(run_config, enabled=refresh_only_stale)
     run_config["tira"]["page_limit"] = max(1, int(page_limit))
+    sink, _run_id = _open_run_sink("tira", run_config)
     detail_config = run_config["tira"].get("details", {})
     detail_config = detail_config if isinstance(detail_config, dict) else {}
     details_enabled = (
@@ -556,6 +749,7 @@ def collect_tira(
         site_config=run_config["tira"],
         request_config=run_config["request"],
         brands=run_config.get("brands", ()),
+        **_sleeper_kwargs(sleeper),
     ) as client:
         selected = client.select_categories(list(categories))
         checkpoint_dir = Path(
@@ -601,9 +795,6 @@ def collect_tira(
             collection_id: store.load_products()
             for collection_id, store in listing_stores.items()
         }
-        resumed_products = sum(
-            len(products) for products in previous_by_collection.values()
-        )
         live_listing_ids = {
             product.product_id
             for products in previous_by_collection.values()
@@ -651,6 +842,8 @@ def collect_tira(
                 ) -> None:
                     saved_products = list(page_products)
                     current_store.append_page(page, saved_products)
+                    if sink is not None:
+                        sink.add(saved_products)
                     live_listing_ids.update(
                         product.product_id for product in saved_products
                     )
@@ -725,11 +918,29 @@ def collect_tira(
                     or not product.sku
                 )
             }
-            detail_count = len(candidates)
             processed_before = detail_store.load_processed_ids()
             enriched_before = detail_store.load_products()
-            resumed_products += len(enriched_before)
             processed_live = set(processed_before)
+
+            # Reuse the stored price for variants nothing has changed about.
+            # Tira only asks for variants whose listing row has no price, so
+            # this mostly helps a re-run that already resolved them once.
+            reused = _reuse_current_details(
+                site="tira",
+                representatives=dict(candidates),
+                listing_products=listing_products,
+                detail_store=detail_store,
+                processed_before=processed_before,
+                policy=refresh_policy,
+                csv_path=_output_paths(run_config, output_path)[1],
+                use_database=_database_sync_enabled(run_config),
+                parent_of=lambda product: product.product_id,
+            )
+            processed_live |= reused.parent_ids
+            for product_id in reused.parent_ids:
+                candidates.pop(product_id, None)
+            detail_count = len(candidates)
+
             priced_ids = {
                 product.product_id
                 for product in listing_products
@@ -738,6 +949,7 @@ def collect_tira(
             priced_ids.update(
                 product.product_id for product in enriched_before
             )
+            priced_ids |= reused.product_ids
 
             if progress_callback is not None:
                 progress_callback(
@@ -762,6 +974,8 @@ def collect_tira(
                 try:
                     enriched = client.fetch_variant_price(product)
                     detail_store.append_parent(product_id, [enriched])
+                    if sink is not None:
+                        sink.add([enriched])
                     processed_live.add(product_id)
                     priced_ids.add(product_id)
                 except Exception as exc:
@@ -813,11 +1027,13 @@ def collect_tira(
             csv_path,
             replacing_site="tira",
         )
+        _close_sink(sink, complete_sweep=completed)
         export = export_products(
             combined_products,
             excel_path,
             csv_path,
-            sync_database=_database_sync_enabled(run_config),
+            sync_database=_needs_final_sync(run_config, sink),
+            write_excel=_write_excel_here(),
             status_callback=_export_status_callback(progress_callback),
         )
         return CollectionResult(
@@ -834,17 +1050,37 @@ def collect_tira(
             completed=completed,
             next_page=next_page,
             stop_reasons=tuple(dict.fromkeys(stop_reasons)),
-            resumed_products=resumed_products,
-            checkpoint_paths=tuple(
-                [
-                    store.state_path
-                    for store in listing_stores.values()
-                ]
-                + [detail_store.state_path]
-            ),
             listing_products=len(listing_products),
             detail_parents=detail_count,
         )
+
+
+def _current_amazon_products(
+    policy: RefreshPolicy,
+    csv_path: Path | None,
+    *,
+    use_database: bool,
+) -> dict[str, Product]:
+    """Stored Amazon products that are complete and inside the refresh window."""
+    if not policy.enabled:
+        return {}
+    known, source = load_known_products(
+        "amazon", csv_path=csv_path, use_database=use_database
+    )
+    if not known:
+        return {}
+    plan = build_plan(
+        [],
+        known,
+        policy=policy,
+        known_source=source,
+    )
+    stored = plan.stored_products()
+    return {
+        product_id: product
+        for product_id, product in stored.items()
+        if not decide(product, known[product_id], policy=policy).needed
+    }
 
 
 def collect_amazon(
@@ -855,13 +1091,17 @@ def collect_amazon(
     *,
     resume: bool = True,
     enrich_details: bool | None = None,
+    refresh_only_stale: bool | None = None,
     progress_callback: ProgressCallback | None = None,
+    sleeper: Callable[[float], None] | None = None,
 ) -> CollectionResult:
     """Collect Amazon search results and public product-page details."""
     del enrich_details
     amazon_client_class = _load_amazon_client()
     run_config = copy.deepcopy(config)
+    refresh_policy = RefreshPolicy.from_config(run_config, enabled=refresh_only_stale)
     run_config["amazon"]["search_page_limit"] = max(1, int(page_limit))
+    sink, _run_id = _open_run_sink("amazon", run_config)
     requested_categories = list(categories)
     scope_source = (
         "|".join(sorted(name.casefold() for name in requested_categories))
@@ -887,19 +1127,40 @@ def collect_amazon(
     processed_before = detail_store.load_processed_ids()
     resumed = detail_store.load_products()
 
+    # Amazon costs a full page load per product, so the refresh check saves the
+    # most here. There is no cheap listing to compare against, so an ASIN is
+    # skipped purely on its stored record being complete and recent; a price
+    # change is caught by the next refresh window rather than the same day.
+    current = _current_amazon_products(
+        refresh_policy,
+        _output_paths(run_config, output_path)[1],
+        use_database=_database_sync_enabled(run_config),
+    )
+    skip_asins = set(processed_before)
+    for product_id, product in current.items():
+        if product_id in processed_before:
+            continue
+        detail_store.append_parent(product_id, [product])
+        skip_asins.add(product_id)
+    if current:
+        LOGGER.info("refresh_reused site=amazon products=%s", len(current))
+
     with amazon_client_class(
         site_config=run_config["amazon"],
         request_config=run_config["request"],
         brands=run_config.get("brands", ()),
+        **_sleeper_kwargs(sleeper),
     ) as client:
         selected = client.select_categories(requested_categories)
 
         def save_product(product: Product) -> None:
             detail_store.append_parent(product.product_id, [product])
+            if sink is not None:
+                sink.add([product])
 
         run = client.scrape(
             selected,
-            processed_asins=processed_before,
+            processed_asins=skip_asins,
             on_product=save_product,
             progress_callback=progress_callback,
         )
@@ -932,11 +1193,13 @@ def collect_amazon(
             csv_path,
             replacing_site="amazon",
         )
+        _close_sink(sink, complete_sweep=run.completed)
         export = export_products(
             combined_products,
             excel_path,
             csv_path,
-            sync_database=_database_sync_enabled(run_config),
+            sync_database=_needs_final_sync(run_config, sink),
+            write_excel=_write_excel_here(),
             status_callback=_export_status_callback(progress_callback),
         )
         return CollectionResult(
@@ -953,8 +1216,6 @@ def collect_amazon(
             completed=run.completed,
             next_page=None,
             stop_reasons=tuple(stop_reasons),
-            resumed_products=len(resumed),
-            checkpoint_paths=(detail_store.state_path,),
             listing_products=run.discovered_asins,
             detail_parents=len(detail_store.load_processed_ids()),
         )

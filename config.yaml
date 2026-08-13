@@ -6,9 +6,14 @@ brands: []
 
 request:
   timeout_seconds: 35
-  delay_min_seconds: 2.0
-  delay_max_seconds: 5.0
-  max_requests_per_minute: 12
+  # The retailer APIs answer in well under a second, so the old 2-5 second
+  # delay behind a 12/minute cap left the scraper idle ~93% of the time and
+  # made a full Nykaa refresh an eight-hour job. Raise the pace in steps and
+  # watch the failure/block counters in the run summary: soft-block backoff
+  # and resumable checkpoints make a bad setting recoverable, not free.
+  delay_min_seconds: 0.5
+  delay_max_seconds: 1.5
+  max_requests_per_minute: 30
   max_retries: 4
   backoff_base_seconds: 2.0
   backoff_max_seconds: 45.0
@@ -129,7 +134,9 @@ tira:
   # Refresh these from the page bootstrap if the size endpoint returns 401.
   application_id: "62d53777f5ad942d3e505f77"
   application_token: "ikdiQv6tj"
-  page_size: 50
+  # The endpoint accepts up to 100 items per page, which halves the number of
+  # listing requests for the same catalogue.
+  page_size: 100
   page_limit: 200
   checkpoint_dir: data/checkpoints
   details:
@@ -234,6 +241,24 @@ database:
   # Credentials stay in .env. This flag prevents library/tests from writing
   # unless the production application explicitly opts in.
   enabled: true
+
+refresh:
+  # Every run compares what it discovers against the catalogue already stored
+  # (Supabase when configured, otherwise the combined CSV) and requests a
+  # product only when it is new, when the listing shows it changed, when its
+  # stored record is missing the fields below, or when that record is older
+  # than refresh_days. Set enabled: false, or pass --full, to request
+  # everything regardless.
+  enabled: true
+  # Left unset this follows automation.detail_refresh_days.
+  refresh_days: 30
+  # Fields a successful detail request always fills. Keep this narrow:
+  # ingredients, how_to_use and gtin are legitimately absent for many real
+  # products, so requiring them would re-request those products forever.
+  # Use --gtin-only to fill barcodes instead.
+  required_fields:
+    - description
+    - image_urls
 
 automation:
   # Nightly jobs always sweep listings, then request full details only for

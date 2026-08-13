@@ -5,14 +5,14 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
 
 from pricing_scraper.clients.base import RequestFailed
 from pricing_scraper.clients.nykaa import NykaaClient
 from pricing_scraper.clients.tira import TiraClient
-from pricing_scraper.database import DatabaseSyncResult, SupabaseCatalogStore
+from pricing_scraper.database import SupabaseCatalogStore
 from pricing_scraper.exporter import deduplicate
 from pricing_scraper.models import Product
 
@@ -68,7 +68,6 @@ class NightlySummary:
     requests: int = 0
     complete_catalogue: bool = False
     message: str = ""
-    database_result: DatabaseSyncResult | None = None
 
 
 def _stable_value(value: Any) -> Any:
@@ -484,7 +483,7 @@ def run_incremental_site(
                     price_rows.append(_history_row(product, observed_at))
 
             seen_ids = [product.product_id for product in final_products]
-            db_result = store.incremental_sync(
+            store.incremental_sync(
                 site=site,
                 run_id=run_id,
                 rows=rows_to_write,
@@ -493,7 +492,6 @@ def run_incremental_site(
                 complete_catalogue=complete,
                 missing_runs_before_inactive=inactive_threshold,
             )
-            summary.database_result = db_result
             summary.products_new = len(new_ids)
             all_changed_ids = changed_ids | content_changed_ids
             summary.products_changed = len(all_changed_ids)

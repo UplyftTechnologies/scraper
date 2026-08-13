@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -56,6 +58,43 @@ def build_parser() -> argparse.ArgumentParser:
         default=3,
         help="Number of normalized records to print (default: 3; use 0 to hide).",
     )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help=(
+            "Re-request every product. By default a run skips products whose "
+            "stored record is complete, unchanged, and inside the refresh "
+            "window."
+        ),
+    )
+    parser.add_argument(
+        "--gtin-only",
+        action="store_true",
+        help=(
+            "Collect only missing barcodes for the selected site, using the "
+            "cheapest request each retailer offers, and leave every other "
+            "field untouched."
+        ),
+    )
+    parser.add_argument(
+        "--gtin-limit",
+        type=int,
+        default=0,
+        help="Cap how many products a --gtin-only run requests (0 = no cap).",
+    )
+    parser.add_argument(
+        "--refresh-all-gtins",
+        action="store_true",
+        help="With --gtin-only, also re-read barcodes that are already stored.",
+    )
+    parser.add_argument(
+        "--gtin-no-sync-db",
+        action="store_true",
+        help=(
+            "With --gtin-only, write the Excel and CSV but skip Supabase. By "
+            "default a barcode sweep syncs like any other run."
+        ),
+    )
     return parser
 
 
@@ -101,6 +140,56 @@ def _print_summary(
             print(f"Database warning: {result.database_error}")
     else:
         print("Database: disabled (add Supabase credentials to .env)")
+
+
+def _progress_printer(interval_seconds: float = 10.0) -> Any:
+    """Print a progress line periodically instead of once per product.
+
+    A barcode sweep can run for half an hour behind the request rate limit, and
+    the per-request client log says nothing about how far through it is.
+    """
+    last = [0.0]
+
+    def report(_stage: str, current: int, total: int, message: str) -> None:
+        now = time.monotonic()
+        final = bool(total) and current >= total
+        if not final and current and now - last[0] < interval_seconds:
+            return
+        last[0] = now
+        print(f"  {message}", flush=True)
+
+    return report
+
+
+def run_gtin_only(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    """Fill in missing barcodes for one site without a full collection."""
+    from pricing_scraper.gtin_scrape import collect_gtins
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    sites = ("nykaa", "tira", "amazon") if args.site == "all" else (args.site,)
+    for site in sites:
+        print(f"\nCollecting {site} barcodes...")
+        result = collect_gtins(
+            config,
+            site,
+            output_path=args.output,
+            only_missing=not args.refresh_all_gtins,
+            limit=max(0, int(args.gtin_limit)),
+            sync_database=not args.gtin_no_sync_db,
+            progress_callback=_progress_printer(),
+        )
+        print(f"\n{result.summary()}")
+        sources: dict[str, int] = {}
+        for origin in result.found_by.values():
+            sources[origin] = sources.get(origin, 0) + 1
+        for origin, count in sorted(sources.items(), key=lambda item: -item[1]):
+            print(f"  from {origin}: {count}")
+        if result.export is not None:
+            print(f"  Excel: {result.export.excel_path}")
+            print(f"  CSV: {result.export.csv_path}")
+        else:
+            print("  Nothing changed, so the export was left alone.")
+    return 0
 
 
 def run_nykaa(args: argparse.Namespace, config: dict[str, Any]) -> int:
@@ -170,6 +259,7 @@ def run_tira(args: argparse.Namespace, config: dict[str, Any]) -> int:
         output_path=args.output,
         resume=True,
         enrich_details=True,
+        refresh_only_stale=not args.full,
     )
     preview_limit = max(0, args.preview_limit)
     if preview_limit:
@@ -203,6 +293,7 @@ def run_amazon(args: argparse.Namespace, config: dict[str, Any]) -> int:
         int(config["amazon"].get("search_page_limit", 2)),
         output_path=args.output,
         resume=True,
+        refresh_only_stale=not args.full,
     )
     preview_limit = max(0, args.preview_limit)
     if preview_limit:
@@ -235,6 +326,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config(args.config)
         apply_environment_overrides(config)
+        if args.gtin_only:
+            return run_gtin_only(args, config)
         if args.site == "nykaa":
             return run_nykaa(args, config)
         if args.site == "tira":

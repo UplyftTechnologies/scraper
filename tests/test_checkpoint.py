@@ -140,6 +140,100 @@ class CheckpointTests(unittest.TestCase):
             self.assertTrue(completed.completed)
             self.assertEqual(completed.products_saved, 1)
 
+    def test_null_filled_detail_state_rebuilds_from_append_only_files(self):
+        """A crash-damaged state file must not end the run before it starts.
+
+        An interrupted rename leaves the state file the right length and full
+        of NUL bytes. Everything it recorded is recoverable from the processed
+        and products files beside it, so the run has to resume, not fail.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = DetailCheckpointStore(
+                Path(directory),
+                site="nykaa",
+                category_id="scope",
+            )
+            store.append_parent(
+                "parent-1",
+                [
+                    Product(
+                        site="nykaa",
+                        product_id="sku-1",
+                        brand="Brand",
+                        product_name="Serum",
+                    )
+                ],
+            )
+            damaged_length = store.state_path.stat().st_size
+            store.state_path.write_bytes(b"\x00" * damaged_length)
+
+            state = store.load_state()
+
+            self.assertFalse(state.completed)
+            self.assertEqual(state.parents_processed, 1)
+            self.assertEqual(state.products_saved, 1)
+            self.assertEqual(store.load_processed_ids(), {"parent-1"})
+            # The damaged file is kept for diagnosis and replaced with a
+            # readable one, so the next run does not repeat the recovery.
+            self.assertTrue(
+                any(
+                    path.name.startswith(f"{store.state_path.name}.corrupt-")
+                    for path in Path(directory).iterdir()
+                )
+            )
+            self.assertEqual(store.load_state().parents_processed, 1)
+
+    def test_null_filled_listing_state_restarts_category_from_first_page(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = CheckpointStore(
+                Path(directory),
+                site="nykaa",
+                category_id="8377",
+                start_page=1,
+            )
+            store.append_page(
+                1,
+                [
+                    Product(
+                        site="nykaa",
+                        product_id="sku-1",
+                        brand="Brand",
+                        product_name="Face wash",
+                    )
+                ],
+            )
+            store.state_path.write_bytes(
+                b"\x00" * store.state_path.stat().st_size
+            )
+
+            state = store.load_state()
+
+            self.assertEqual(state.next_page, 1)
+            self.assertFalse(state.completed)
+            # The rows already collected survive; the client is given their IDs
+            # so the repeated pages cost requests, not data.
+            self.assertEqual(
+                [item.product_id for item in store.load_products()],
+                ["sku-1"],
+            )
+
+    def test_state_file_is_flushed_before_the_rename(self):
+        """The write must leave no temporary file and must be readable at once."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = DetailCheckpointStore(
+                Path(directory),
+                site="tira",
+                category_id="scope",
+            )
+            store.append_parent("parent-1", [])
+
+            self.assertTrue(store.state_path.exists())
+            self.assertEqual(
+                [path.name for path in Path(directory).glob("*.tmp")],
+                [],
+            )
+            self.assertNotIn(b"\x00", store.state_path.read_bytes())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 import logging
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -8,10 +9,90 @@ from pricing_scraper.clients.base import RequestFailed
 from pricing_scraper.clients.nykaa import CategoryScrapeResult
 from pricing_scraper.dashboard_service import (
     _full_catalog_partitions,
+    _sleeper_kwargs,
     collect_nykaa,
     collect_tira,
 )
 from pricing_scraper.models import Product
+
+
+class SleeperForwardingTests(unittest.TestCase):
+    def test_a_supplied_sleeper_reaches_the_client(self):
+        def sleeper(_seconds: float) -> None:
+            return None
+
+        self.assertEqual(_sleeper_kwargs(sleeper), {"sleeper": sleeper})
+
+    def test_no_sleeper_leaves_the_client_default_alone(self):
+        self.assertEqual(_sleeper_kwargs(None), {})
+
+    def test_collect_nykaa_passes_the_sleeper_to_the_client(self):
+        received: dict[str, object] = {}
+
+        class FakeNykaaClient:
+            start_page = 1
+
+            def __init__(self, *_args, **kwargs):
+                received.update(kwargs)
+                self.page_failures = 0
+                self.product_failures = 0
+                self.detail_failures = 0
+                self.blocks_encountered = 0
+                self.requests_made = 0
+                self.logger = logging.getLogger("fake-nykaa-sleeper")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def select_categories(self, _names):
+                return [{"id": "1", "name": "Test"}]
+
+            def scrape_category_resumable(self, *_args, **_kwargs):
+                return CategoryScrapeResult(
+                    products=[],
+                    next_page=1,
+                    completed=True,
+                    pages_scraped=0,
+                    stop_reason="",
+                )
+
+        def sleeper(_seconds: float) -> None:
+            return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = {
+                "nykaa": {
+                    "page_limit": 1,
+                    "checkpoint_dir": str(root / "checkpoints"),
+                    "details": {"enabled": False},
+                },
+                "request": {},
+                "brands": [],
+                "output": {
+                    "excel_path": str(root / "pricing.xlsx"),
+                    "combined_csv_path": str(root / "pricing.csv"),
+                },
+            }
+            with patch(
+                "pricing_scraper.dashboard_service.NykaaClient", FakeNykaaClient
+            ):
+                with self.assertRaises(ValueError):
+                    # No products come back, which is a separate failure; the
+                    # client was still constructed with the sleeper.
+                    collect_nykaa(
+                        config,
+                        ["Test"],
+                        1,
+                        enrich_details=False,
+                        refresh_only_stale=False,
+                        sleeper=sleeper,
+                    )
+
+        self.assertIs(received.get("sleeper"), sleeper)
 
 
 class DashboardServiceTests(unittest.TestCase):
@@ -36,7 +117,7 @@ class DashboardServiceTests(unittest.TestCase):
             }
         ]
 
-        partitions = _full_catalog_partitions(None, selected)  # type: ignore[arg-type]
+        partitions = _full_catalog_partitions(selected)
 
         self.assertEqual(
             [item["checkpoint_key"] for item in partitions],
@@ -133,6 +214,7 @@ class DashboardServiceTests(unittest.TestCase):
                     ["Test"],
                     1,
                     enrich_details=True,
+                    refresh_only_stale=False,
                 )
 
         self.assertFalse(result.completed)
@@ -224,6 +306,7 @@ class DashboardServiceTests(unittest.TestCase):
                     ["Test"],
                     1,
                     enrich_details=True,
+                    refresh_only_stale=False,
                 )
 
             processed = "\n".join(
@@ -322,6 +405,7 @@ class DashboardServiceTests(unittest.TestCase):
                     ["All Skin"],
                     1,
                     enrich_details=True,
+                    refresh_only_stale=False,
                 )
 
         self.assertFalse(result.completed)
@@ -332,3 +416,173 @@ class DashboardServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RefreshReuseTests(unittest.TestCase):
+    """A skipped product must cost no request and still reach the export."""
+
+    class FakeNykaaClient:
+        start_page = 1
+        detail_calls: list = []
+
+        def __init__(self, *_args, **_kwargs):
+            self.failures = 0
+            self.page_failures = 0
+            self.product_failures = 0
+            self.detail_failures = 0
+            self.blocks_encountered = 0
+            self.requests_made = 1
+            self.logger = logging.getLogger("fake-nykaa-refresh")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def select_categories(self, _names):
+            return [{"id": "10", "name": "Test"}]
+
+        def scrape_category_resumable(
+            self, _category, *, start_page, seen_product_ids, on_page
+        ):
+            del start_page, seen_product_ids
+            listing = Product(
+                site="nykaa",
+                product_id="sku-1",
+                parent_product_id="parent-1",
+                brand="Brand",
+                product_name="Cleanser",
+                selling_price=400.0,
+            )
+            on_page(1, [listing])
+            return CategoryScrapeResult(
+                products=[listing],
+                next_page=2,
+                completed=True,
+                pages_scraped=1,
+                stop_reason="",
+            )
+
+        def fetch_product_details(self, product):
+            type(self).detail_calls.append(product.product_id)
+            return [
+                Product(
+                    site="nykaa",
+                    product_id=product.product_id,
+                    parent_product_id=product.parent_product_id,
+                    brand=product.brand,
+                    product_name=product.product_name,
+                    selling_price=product.selling_price,
+                    description="freshly fetched",
+                    image_urls=["https://example.test/new.jpg"],
+                )
+            ]
+
+    def _config(self, root):
+        return {
+            "nykaa": {
+                "page_limit": 1,
+                "checkpoint_dir": str(root / "checkpoints"),
+                "details": {"enabled": True},
+            },
+            "request": {},
+            "brands": [],
+            "output": {
+                "excel_path": str(root / "pricing.xlsx"),
+                "combined_csv_path": str(root / "pricing.csv"),
+            },
+            "refresh": {"enabled": True, "refresh_days": 30},
+        }
+
+    def _seed(self, csv_path, *, scraped_at, description="stored description"):
+        from pricing_scraper.exporter import export_products
+
+        export_products(
+            [
+                Product(
+                    site="nykaa",
+                    product_id="sku-1",
+                    parent_product_id="parent-1",
+                    brand="Brand",
+                    product_name="Cleanser",
+                    selling_price=400.0,
+                    description=description,
+                    image_urls=["https://example.test/stored.jpg"],
+                    scraped_at=scraped_at,
+                )
+            ],
+            csv_path.with_suffix(".xlsx"),
+            csv_path,
+        )
+
+    def _run(self, root):
+        with patch(
+            "pricing_scraper.dashboard_service.NykaaClient",
+            self.FakeNykaaClient,
+        ):
+            return collect_nykaa(self._config(root), ["Test"], 1, enrich_details=True)
+
+    def test_a_current_product_is_not_requested_again(self):
+        RefreshReuseTests.FakeNykaaClient.detail_calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._seed(
+                root / "pricing.csv",
+                scraped_at=datetime.now(timezone.utc).isoformat(),
+            )
+            result = self._run(root)
+
+        self.assertEqual(self.FakeNykaaClient.detail_calls, [])
+        # The stored content must survive: refreshing a retailer cannot strip
+        # the description off every product it decided not to re-request.
+        stored = {item.product_id: item for item in result.products}
+        self.assertEqual(stored["sku-1"].description, "stored description")
+
+    def test_a_stale_product_is_requested(self):
+        RefreshReuseTests.FakeNykaaClient.detail_calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old = (datetime.now(timezone.utc) - timedelta(days=120)).isoformat()
+            self._seed(root / "pricing.csv", scraped_at=old)
+            result = self._run(root)
+
+        self.assertEqual(self.FakeNykaaClient.detail_calls, ["sku-1"])
+        stored = {item.product_id: item for item in result.products}
+        self.assertEqual(stored["sku-1"].description, "freshly fetched")
+
+    def test_a_product_missing_content_is_requested(self):
+        RefreshReuseTests.FakeNykaaClient.detail_calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._seed(
+                root / "pricing.csv",
+                scraped_at=datetime.now(timezone.utc).isoformat(),
+                description="",
+            )
+            self._run(root)
+
+        self.assertEqual(self.FakeNykaaClient.detail_calls, ["sku-1"])
+
+    def test_disabling_the_check_requests_everything(self):
+        RefreshReuseTests.FakeNykaaClient.detail_calls = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._seed(
+                root / "pricing.csv",
+                scraped_at=datetime.now(timezone.utc).isoformat(),
+            )
+            config = self._config(root)
+            with patch(
+                "pricing_scraper.dashboard_service.NykaaClient",
+                self.FakeNykaaClient,
+            ):
+                collect_nykaa(
+                    config,
+                    ["Test"],
+                    1,
+                    enrich_details=True,
+                    refresh_only_stale=False,
+                )
+
+        self.assertEqual(self.FakeNykaaClient.detail_calls, ["sku-1"])

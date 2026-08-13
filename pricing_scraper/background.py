@@ -17,16 +17,26 @@ import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 RUNS_DIRNAME = Path("data") / "runs"
 ACTIVE_STATES = frozenset({"starting", "running"})
+# A live worker rewrites its status on every page and every parent it finishes.
+# The quietest stretch is the final export and database sync, so the timeout is
+# generous; anything past it means nobody is working on the run.
+HEARTBEAT_TIMEOUT_SECONDS = 1_800
 
 
-class RunStopped(RuntimeError):
-    """Raised inside the worker when the dashboard asks the run to stop."""
+class RunStopped(BaseException):
+    """Raised inside the worker when the dashboard asks the run to stop.
+
+    It derives from BaseException on purpose. The clients and the collection
+    service isolate per-page and per-product failures with broad ``except
+    Exception`` handlers, and a stop that those handlers could swallow would
+    leave the dashboard's button looking broken.
+    """
 
 
 @dataclass(slots=True)
@@ -39,6 +49,11 @@ class RunRequest:
     resume: bool
     enrich_details: bool
     config_path: str
+    # "collect" runs a normal collection; "gtin" fills in missing barcodes only.
+    mode: str = "collect"
+    refresh_only_stale: bool = True
+    gtin_all: bool = False
+    gtin_limit: int = 0
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
 
@@ -100,19 +115,32 @@ def write_status(
     values: Mapping[str, Any],
     *,
     root: Path | None = None,
+    heartbeat: bool = True,
 ) -> dict[str, Any]:
     """Merge values into the run's status file and return the full status.
 
     The file is replaced atomically so a dashboard polling it never reads a
     half-written document.
+
+    ``heartbeat`` records that the worker itself is alive. Dashboard-side
+    writes pass ``False``: a stop request proves the browser is working, not
+    that anyone is still collecting, and treating it as a sign of life would
+    keep an abandoned run looking active.
     """
     status = read_status(run_id, root=root) or {"run_id": run_id}
     status.update(values)
     status["updated_at"] = _now()
+    if heartbeat:
+        status["heartbeat"] = status["updated_at"]
     payload = json.dumps(status, ensure_ascii=False, indent=2)
     path = _status_path(run_id, root)
     temporary = path.with_suffix(".tmp")
-    temporary.write_text(payload, encoding="utf-8")
+    # Flush to disk before renaming. A rename that reaches the disk ahead of
+    # the contents leaves a NUL-filled file behind after a crash, which is how
+    # a status or checkpoint file becomes unreadable.
+    with temporary.open("wb", buffering=0) as handle:
+        handle.write(payload.encode("utf-8"))
+        os.fsync(handle.fileno())
     for attempt in range(5):
         try:
             os.replace(temporary, path)
@@ -192,16 +220,17 @@ def active_status(root: Path | None = None) -> dict[str, Any] | None:
     for status in all_statuses(root):
         if status.get("state") not in ACTIVE_STATES:
             continue
-        pid = status.get("pid")
-        if pid and not _process_alive(int(pid)):
+        reason = _death_reason(status)
+        if reason:
+            run_id = str(status["run_id"])
+            # The stop file would otherwise outlive the run and confuse the
+            # next reader of this directory.
+            _stop_path(run_id, root).unlink(missing_ok=True)
             return write_status(
-                str(status["run_id"]),
+                run_id,
                 {
                     "state": "failed",
-                    "error": (
-                        "The worker process exited without finishing. Check "
-                        "the run log for the cause."
-                    ),
+                    "error": f"{reason} Check the run log for the cause.",
                     "finished_at": _now(),
                 },
                 root=root,
@@ -210,25 +239,107 @@ def active_status(root: Path | None = None) -> dict[str, Any] | None:
     return None
 
 
-def _process_alive(pid: int) -> bool:
-    """Report whether a process id is still running, portably."""
+def _parse_timestamp(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _system_boot_time() -> datetime | None:
+    """When this machine last booted, or None when it cannot be determined.
+
+    Nothing that was running before the last boot is running now, which is the
+    only reliable way to retire a run whose process id has been recycled.
+    """
+    now = datetime.now(timezone.utc)
     if sys.platform == "win32":
         try:
-            output = subprocess.run(
+            import ctypes
+
+            milliseconds = ctypes.windll.kernel32.GetTickCount64()
+        except Exception:
+            return None
+        return now - timedelta(milliseconds=int(milliseconds))
+    try:
+        uptime = float(
+            Path("/proc/uptime").read_text(encoding="utf-8").split()[0]
+        )
+    except (OSError, IndexError, ValueError):
+        return None
+    return now - timedelta(seconds=uptime)
+
+
+def _death_reason(status: Mapping[str, Any]) -> str:
+    """Explain why a run marked active cannot still be running, else "".
+
+    A process id alone proves nothing: the operating system reuses ids, so a
+    status left behind by a killed worker can point at an unrelated process
+    that happens to be alive now. Three independent signals are checked.
+    """
+    heartbeat = _parse_timestamp(
+        status.get("heartbeat") or status.get("updated_at")
+    )
+    boot_time = _system_boot_time()
+    if heartbeat is not None and boot_time is not None and heartbeat < boot_time:
+        return "The server restarted while this run was working."
+
+    if heartbeat is not None:
+        idle = (datetime.now(timezone.utc) - heartbeat).total_seconds()
+        if idle > HEARTBEAT_TIMEOUT_SECONDS:
+            return (
+                "The worker stopped reporting progress "
+                f"{int(idle // 60)} minutes ago."
+            )
+
+    pid = status.get("pid")
+    if pid and not _process_alive(int(pid), run_id=str(status.get("run_id") or "")):
+        return "The worker process exited without finishing."
+    return ""
+
+
+def _process_alive(pid: int, *, run_id: str = "") -> bool:
+    """Report whether the worker for this run is still running, portably.
+
+    The process must also look like the worker: a recycled process id running
+    something else entirely does not keep a dead run alive.
+    """
+    if sys.platform == "win32":
+        try:
+            completed = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
                 capture_output=True,
                 text=True,
                 timeout=15,
-            ).stdout
+            )
         except (OSError, subprocess.SubprocessError):
             return True
-        return str(pid) in output
+        output = (completed.stdout or "").strip()
+        # Only a clear answer may retire a run. Under heavy load tasklist can
+        # exit non-zero or return nothing at all, and reading that as "the
+        # process is gone" marks a healthy worker failed - which then lets a
+        # second run of the same site start and collide with its checkpoints.
+        if completed.returncode != 0 or not output:
+            return True
+        if str(pid) not in output:
+            return False
+        image = output.split(None, 1)[0].casefold()
+        # The worker is always started with sys.executable.
+        return "python" in image
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    if run_id:
+        try:
+            command = Path(f"/proc/{pid}/cmdline").read_text(encoding="utf-8")
+        except OSError:
+            return True
+        if command:
+            return run_id in command
     return True
 
 
@@ -250,7 +361,7 @@ def start_run(request: RunRequest, *, root: Path | None = None) -> dict[str, Any
         encoding="utf-8",
     )
     _stop_path(request.run_id, root).unlink(missing_ok=True)
-    status = write_status(
+    write_status(
         request.run_id,
         {
             "run_id": request.run_id,
@@ -282,16 +393,34 @@ def start_run(request: RunRequest, *, root: Path | None = None) -> dict[str, Any
     else:
         start_new_session = True
 
-    with log_path(request.run_id, root).open("w", encoding="utf-8") as log:
-        process = subprocess.Popen(
-            [sys.executable, "-m", "pricing_scraper.background", request.run_id],
-            cwd=str(base),
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            creationflags=creationflags,
-            start_new_session=start_new_session,
+    try:
+        with log_path(request.run_id, root).open("w", encoding="utf-8") as log:
+            process = subprocess.Popen(
+                [sys.executable, "-m", "pricing_scraper.background", request.run_id],
+                cwd=str(base),
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+                start_new_session=start_new_session,
+            )
+    except OSError as exc:
+        # The status was already written as "starting". Left that way, a worker
+        # that never launched would look like a live run and refuse every new
+        # one until the heartbeat timeout expired half an hour later.
+        write_status(
+            request.run_id,
+            {
+                "state": "failed",
+                "message": "The collection process could not be started.",
+                "error": f"{type(exc).__name__}: {exc}",
+                "finished_at": _now(),
+            },
+            root=root,
         )
+        raise RuntimeError(
+            f"Could not start the collection process: {exc}"
+        ) from exc
     return write_status(request.run_id, {"pid": process.pid}, root=root)
 
 
@@ -300,14 +429,76 @@ def request_stop(run_id: str, *, root: Path | None = None) -> None:
     _stop_path(run_id, root).write_text(_now(), encoding="utf-8")
     write_status(
         run_id,
-        {"message": "Stop requested; finishing the current request..."},
+        {
+            "message": "Stop requested; finishing the current request...",
+            "stop_requested_at": _now(),
+        },
         root=root,
+        heartbeat=False,
     )
 
 
 def stop_requested(run_id: str, *, root: Path | None = None) -> bool:
     """Report whether the dashboard asked this run to stop."""
     return _stop_path(run_id, root).exists()
+
+
+def _execute_gtin_only(
+    run_id: str,
+    job: Mapping[str, Any],
+    config: dict[str, Any],
+    site: str,
+    *,
+    report: Any,
+    sleeper: Any,
+    root: Path | None,
+) -> int:
+    """Run the barcode-only mode inside the same detached worker."""
+    from pricing_scraper.gtin_scrape import collect_gtins
+
+    result = collect_gtins(
+        config,
+        site,
+        only_missing=not bool(job.get("gtin_all", False)),
+        limit=max(0, int(job.get("gtin_limit", 0) or 0)),
+        progress_callback=report,
+        sleeper=sleeper,
+    )
+    export = result.export
+    write_status(
+        run_id,
+        {
+            "state": "success",
+            "stage": "finished",
+            "percent": 100,
+            "message": result.summary(),
+            "listing_products": result.stored_products,
+            "detail_parents": result.targeted,
+            "sku_rows": result.found,
+            "completed": True,
+            "gtin_found": result.found,
+            "gtin_targeted": result.targeted,
+            "gtin_coverage": round(result.coverage, 1),
+            "failures": result.failures,
+            "blocks": 0,
+            "requests": result.requests,
+            "stop_reasons": [],
+            "csv_path": str(export.csv_path) if export else "",
+            "excel_path": str(export.excel_path) if export else "",
+            "products_written": export.products_written if export else 0,
+            "database_enabled": export.database_enabled if export else False,
+            "database_products_written": (
+                export.database_products_written if export else 0
+            ),
+            "database_price_points_written": (
+                export.database_price_points_written if export else 0
+            ),
+            "database_error": export.database_error if export else "",
+            "finished_at": _now(),
+        },
+        root=root,
+    )
+    return 0
 
 
 def _execute(run_id: str, *, root: Path | None = None) -> int:
@@ -360,6 +551,33 @@ def _execute(run_id: str, *, root: Path | None = None) -> int:
             root=root,
         )
 
+    def interruptible_sleep(seconds: float) -> None:
+        """Sleep in slices so a stop is noticed inside a long retry backoff.
+
+        Rate limiting and soft-block backoff can wait a minute at a time. Left
+        as one uninterruptible sleep, the dashboard's stop appears to be
+        ignored for as long as that wait lasts.
+        """
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            if stop_requested(run_id, root=root):
+                raise RunStopped("The dashboard asked this run to stop.")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.5, remaining))
+
+    if str(job.get("mode") or "collect") == "gtin":
+        return _execute_gtin_only(
+            run_id,
+            job,
+            config,
+            site,
+            report=report,
+            sleeper=interruptible_sleep,
+            root=root,
+        )
+
     collector = {
         "nykaa": collect_nykaa,
         "tira": collect_tira,
@@ -371,7 +589,9 @@ def _execute(run_id: str, *, root: Path | None = None) -> int:
         int(job["page_limit"]),
         resume=bool(job["resume"]),
         enrich_details=bool(job["enrich_details"]),
+        refresh_only_stale=bool(job.get("refresh_only_stale", True)),
         progress_callback=report,
+        sleeper=interruptible_sleep,
     )
     exported = len(load_products_csv(result.export.csv_path))
     write_status(

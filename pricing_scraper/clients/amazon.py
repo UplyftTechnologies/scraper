@@ -59,16 +59,63 @@ def _by_label(attributes: Mapping[str, Any]) -> dict[str, Any]:
     return {_attribute_label(key): value for key, value in attributes.items()}
 
 
+# Amazon India does not give beauty products a UPC/EAN row, but many sellers
+# put the product's real EAN in the model or part number instead.
+GTIN_LABELS = ("upc", "ean", "ean13", "gtin", "isbn", "barcode")
+GTIN_FALLBACK_LABELS = (
+    "itemmodelnumber",
+    "modelnumber",
+    "manufacturerpartnumber",
+    "itempartnumber",
+    "partnumber",
+)
+# A model number is only a barcode by coincidence, so the fallback is limited
+# to EAN-13/GTIN-14. Eight-digit codes are excluded because a short numeric
+# model number passes the GTIN-8 check digit one time in ten, and 12-digit
+# ones because the seller codes seen in this field pass as UPC-A far more
+# often than they turn out to be real barcodes.
+GTIN_FALLBACK_LENGTHS = frozenset({13, 14})
+
+
+def _plausible_retail_barcode(gtin: str) -> bool:
+    """Reject GS1 prefixes that are never a manufacturer's retail barcode.
+
+    A padded internal code such as ``992880990000`` can carry a valid check
+    digit, but its prefix falls in a range GS1 reserves for coupons or in-store
+    use, so it can be told apart from a genuine EAN like ``8904417306224``
+    (890 = India) without guessing.
+    """
+    prefix = int(gtin[-13:].zfill(13)[:3])
+    restricted = (
+        20 <= prefix <= 29        # restricted circulation within a company
+        or 40 <= prefix <= 49     # restricted circulation within a region
+        or 50 <= prefix <= 59     # coupons
+        or 200 <= prefix <= 299   # in-store / variable measure
+        or prefix >= 980          # refund receipts, coupons, ISSN/ISMN
+    )
+    return not restricted
+
+
 def _attribute_gtin(attributes: Mapping[str, Any]) -> str:
     """Read a barcode from the product-information table when Amazon lists one.
 
-    Amazon India normally publishes only ASIN and manufacturer model numbers,
-    so most beauty products leave this empty.
+    Amazon India publishes no UPC/EAN row on beauty pages, so the model and
+    part number rows are used as a fallback. A value is accepted only when it
+    is a full-length GTIN with a valid GS1 check digit, so a seller's internal
+    code is never exported as a barcode.
     """
     labelled = _by_label(attributes)
-    for label in ("upc", "ean", "ean13", "gtin", "isbn", "barcode"):
+    for label in GTIN_LABELS:
         gtin = normalize_gtin(labelled.get(label))
         if gtin:
+            return gtin
+    for label in GTIN_FALLBACK_LABELS:
+        gtin = normalize_gtin(labelled.get(label))
+        if (
+            gtin
+            and len(gtin) in GTIN_FALLBACK_LENGTHS
+            and _plausible_retail_barcode(gtin)
+        ):
             return gtin
     return ""
 

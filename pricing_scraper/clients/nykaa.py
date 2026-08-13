@@ -1149,12 +1149,6 @@ class NykaaClient(BaseJsonClient):
 
             consecutive_page_failures = 0
             records = self._product_records(payload)
-            response_metadata = (
-                payload.get("response")
-                if isinstance(payload, Mapping)
-                and isinstance(payload.get("response"), Mapping)
-                else {}
-            )
             self.logger.info(
                 "nykaa_page category=%s page=%s records=%s parse=success",
                 category.get("name", ""),

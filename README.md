@@ -39,18 +39,36 @@ ingredient names. The full INCI list stays in `ingredients`.
 
 The `gtin` column holds the retailer's own barcode for that exact SKU:
 
-- **Nykaa** publishes one per SKU, so this column is populated for Nykaa rows.
-- **Tira** publishes only its internal numeric item code, which is already
-  exported as `sku`. `gtin` stays blank unless Tira starts returning a real
-  barcode in its identifier lists.
-- **Amazon India** does not list UPC/EAN on beauty product pages — the detail
-  table carries ASIN, model number, and part number only — so `gtin` stays
-  blank. The parser still reads a `UPC`/`EAN`/`GTIN` row if one appears.
+- **Nykaa** publishes one per SKU in its product-detail response, so coverage
+  is close to total — but only for rows collected with detail enrichment. A
+  listing-only sweep leaves the column blank.
+- **Tira** publishes a real barcode for about two thirds of its catalogue. It
+  used to expose only its internal numeric item code, which is exported as
+  `sku`; rows without a published barcode still leave `gtin` blank.
+- **Amazon India** has no UPC/EAN row on beauty product pages — the detail
+  table carries ASIN, model number, and part number only. Many sellers put the
+  product's real EAN in the model or part number, so those rows are read as a
+  fallback under the extra restrictions below.
 
-The `gtin` value is only accepted when it is a digit string of GTIN-8/12/13/14 length
-whose GS1 check digit is valid, so a seller code that merely looks numeric is
-never exported as a barcode. Parent-level barcodes are never copied onto other
-size variants: each row carries its own barcode or nothing.
+The `gtin` value is only accepted when it is a digit string of GTIN-8/12/13/14
+length whose GS1 check digit is valid, so a seller code that merely looks
+numeric is never exported as a barcode. Parent-level barcodes are never copied
+onto other size variants: each row carries its own barcode or nothing.
+
+Amazon's model/part-number fallback is held to a stricter standard than a
+published barcode row, because the field usually holds something else:
+
+- only EAN-13 and GTIN-14 lengths are accepted. An eight-digit model number
+  passes the GTIN-8 check digit one time in ten, and every such value measured
+  against Nykaa's published barcode disagreed with it.
+- GS1 prefixes reserved for coupons and in-store use are refused, which is what
+  separates a padded internal code such as `992880990000` from a genuine EAN
+  such as `8904417306224` (890 = India).
+
+Measured against Nykaa's published barcodes for the same products, the values
+Amazon yields this way agreed in 10 of 13 cases; the exceptions were valid
+barcodes for a different pack, which the cross-platform matcher then rejects
+as a mismatched pair.
 
 The configured comparison taxonomy is identical for all three sites:
 
@@ -120,6 +138,12 @@ Brands are filtered while listings are parsed, so a filtered Nykaa or Tira run
 skips the product-detail requests for excluded products. Amazon searches by
 category first and drops non-matching brands from the results.
 
+The barcode-only mode applies the same filter separately. It reaches products
+by ID out of the saved catalogue rather than through a listing, so the clients'
+own filter never sees them — and a catalogue collected under an older
+`SCRAPE_BRANDS` still holds brands that are no longer wanted. Those products
+are skipped and reported, and cross-filled barcodes respect the filter too.
+
 A brand-filtered nightly run is treated as a partial sweep: it never sees the
 rest of the catalogue, so it never ages other brands into `is_active = false`.
 Filtered runs still add and update rows normally.
@@ -156,7 +180,8 @@ The database integration enables itself when both values exist. Leave both
 blank to keep database writes disabled. With
 `DATABASE_SYNC_REQUIRED=true`, a failed database write prevents the dashboard
 from reporting **Scraping complete**, while the Excel and CSV files remain
-saved locally.
+saved locally: the export is written first and the database is contacted
+afterwards, so an outage costs the sync, never the collection.
 
 The current Supabase secret key is preferred; the integration also accepts the
 legacy `SUPABASE_SERVICE_ROLE_KEY`. `.env` is ignored by Git. Both key types
@@ -190,6 +215,41 @@ become inactive; partial or blocked sweeps never age missing products.
 
 Every run is saved in `retailer_scrape_runs` with independent Nykaa/Tira
 status, product counts, failures, blocks, requests, and start/end times.
+
+### Streaming to the database during a run
+
+A run writes each batch of products to Supabase as it scrapes, at the same
+points it commits to its checkpoint — every listing page and every enriched
+parent. Batches are 100 rows, so a ten-thousand product catalogue costs about
+100 requests on top of the ~5,000 the scrape already makes.
+
+This replaced an end-of-run sync that pushed the whole catalogue at once:
+
+- **Memory stays flat.** Nothing accumulates for a single large write.
+- **A run that dies keeps its work.** Previously a collection that failed at
+  hour two of three wrote nothing at all.
+- **The database fills in real time** rather than in one lump at the end.
+
+The end-of-run sync now only runs when a streamed batch failed, acting as the
+reconciliation pass. A failed batch never ends a run: the checkpoint is still
+the source of truth for resuming, and the export reconciles the rest.
+
+After a **complete** sweep the run calls `finalize_retailer_scrape_run`, so
+products the sweep never saw age towards inactive — the same bookkeeping the
+nightly jobs use. A partial or stopped run skips it, because a run that ended
+early has no opinion about what is missing. So does a run with a failed batch,
+since the gap would make live products look absent.
+
+### Hosted runs skip the workbook
+
+With `HOSTED_DASHBOARD=true` the export writes the CSV and **skips the Excel
+workbook**. Building it holds every cell in memory — around 500 MB for a
+ten-thousand product catalogue — which exceeds a Render `starter` instance, and
+the file would not survive the next restart on a temporary disk anyway. Local
+runs are unchanged and still write both files.
+
+The CSV is streamed row by row and is written before the workbook, so a
+catalogue survives even when the workbook cannot be built.
 
 ### Render deployment
 
@@ -279,13 +339,166 @@ closes, which would otherwise kill a multi-hour collection.
 - One run at a time. A second start is refused while a run is working, because
   concurrent runs would write the same checkpoints and export files.
 - **Stop this run** asks the worker to stop at its next progress checkpoint,
-  leaving the checkpoint intact so the next run resumes from there.
+  leaving the checkpoint intact so the next run resumes from there. The worker
+  also checks the request while it waits out a retry backoff, so a stop does
+  not have to wait for a minute-long delay to elapse first.
 - A worker that dies without finishing is reported as failed the next time the
-  dashboard looks, rather than blocking new runs.
+  dashboard looks, rather than blocking new runs. Liveness is not judged from
+  the recorded process id alone: the operating system reuses process ids, so a
+  status left behind by a killed worker could otherwise point at an unrelated
+  live process and keep a finished run looking active forever. A run is retired
+  when its process is gone or is not the worker, when the machine booted after
+  the run last reported, or when it has not reported for 30 minutes.
 
 The run lives in the server process, not the browser, so it still ends if the
 server itself stops. On Render that means a restart or redeploy cancels an
 in-flight run; the checkpoint survives only until the container is replaced.
+
+## Skipping products that are already up to date
+
+Every run compares what it discovers against the catalogue already stored, and
+requests a product only when there is a reason to. A product is requested when:
+
+- it is **new** — no stored record exists
+- the listing shows it **changed** — price, stock, or name differs from what is
+  stored, caught the same day regardless of age
+- its stored record is **incomplete** — missing any of `refresh.required_fields`
+- its stored record is **stale** — older than `refresh.refresh_days` (30)
+
+Anything else is left alone: its stored detail is reused and written to the
+export exactly as a fresh fetch would be, so skipping never costs content.
+
+The comparison reads Supabase when `database.enabled` is true and credentials
+exist, and the combined CSV otherwise. If neither can be read the run simply
+requests everything, which is what it did before this existed — a freshness
+check may cost extra requests, never the run.
+
+```powershell
+python main.py --site nykaa            # skips products already up to date
+python main.py --site nykaa --full     # re-requests everything
+```
+
+The dashboard exposes the same thing as **Skip products already up to date**.
+Turn it off in `config.yaml`:
+
+```yaml
+refresh:
+  enabled: true
+  refresh_days: 30
+  required_fields: [description, image_urls]
+```
+
+Keep `required_fields` narrow. `ingredients`, `how_to_use`, and `gtin` are
+legitimately absent for many real products, so requiring them would mark those
+products incomplete on every run and re-request them forever. Use the
+barcode-only mode below to fill barcodes instead.
+
+This is separate from the checkpoint. A checkpoint stops one interrupted run
+from repeating work it already did; this stops a *new* run from repeating work
+an *earlier* run did.
+
+## Collecting barcodes only
+
+Filling a missing `gtin` through a normal run means re-requesting each
+product's whole detail payload. `--gtin-only` asks each retailer for the
+cheapest thing that yields a barcode instead, and writes no other field:
+
+```powershell
+python main.py --site nykaa --gtin-only
+python main.py --site amazon --gtin-only --gtin-limit 200
+python main.py --site all --gtin-only --refresh-all-gtins
+```
+
+| Site | Barcode source | Cost |
+| --- | --- | --- |
+| Tira | listing JSON | a listing sweep; no product opened individually |
+| Nykaa | product-detail endpoint | one request per parent still missing one |
+| Amazon | product-information table | free from stored attributes, then one page each |
+
+Amazon is read offline first: because its barcode lives in the model/part
+number, a catalogue scraped before that was supported already contains the
+answer, and only products with no stored attributes need a page opened.
+Re-opening a page whose attributes are already held returns the same
+product-information table, so it cannot yield a barcode the offline pass
+missed — a full sweep spent 522 page opens confirming that and found nothing.
+Pass `recheck_pages=True` to force them anyway, for products whose seller may
+have added an EAN since the last scrape.
+
+### Why Amazon coverage stays low
+
+Amazon India publishes no barcode field, and only about 15% of sellers put a
+real EAN in the model number. Of 596 Amazon products carrying a model or part
+number, 91 were valid barcodes; the rest are seller SKUs, company names, or
+values like `1` and `50ml+100g`. That is the native ceiling, not a parsing gap.
+
+The remaining source is a platform that does publish barcodes. A cross-platform
+match is the same physical product, so its barcode applies, and the sweep fills
+what it can from matched products on other platforms:
+
+| match threshold | agreed | disagreed | accuracy |
+| --- | --- | --- | --- |
+| 0.70 | 26 | 3 | 90% |
+| 0.80 | 23 | 1 | 96% |
+| 0.90 | 25 | 0 | 100% |
+
+Measured against pairs where two platforms each published their own barcode.
+The default `cross_fill_threshold` is therefore `0.90`: looser matches pair
+different pack sizes of the same product, and copying a barcode across them
+would state something false about the SKU. Borrowed barcodes are reported
+separately as `matched <platform>`.
+
+Because Nykaa publishes a barcode per SKU, running `--site nykaa --gtin-only`
+first materially raises what Amazon can borrow afterwards.
+
+Only products with an empty `gtin` are requested unless `--refresh-all-gtins`
+is passed, and `--gtin-limit` caps how many are requested in one go. The
+dashboard offers the same thing as **Collect GTINs only**.
+
+A barcode sweep writes the Excel and CSV **and syncs to Supabase**, exactly as
+a normal collection does, so the barcodes land in `retailer_products` rather
+than only in the local files. Pass `--gtin-no-sync-db` for a local-only sweep.
+If nothing new is found, neither the files nor the database are touched.
+
+## Inserting products from a sheet
+
+Some products never turn up in a sweep. The dashboard sidebar has an
+**Insert products from a sheet** panel: upload a CSV or Excel file, then
+
+- **Check only** — report what would happen and write nothing
+- **Insert** — write the new products into Supabase
+
+Only rows Supabase does not already hold are inserted. Nothing is updated and
+nothing is deleted, so running the same sheet twice is harmless.
+
+`manual_products.template.csv` shows the columns; only `brand` and
+`product_name` are required. Headers are matched by name, so `Vendor`/`Title`
+from a Shopify or marketplace export work unedited.
+
+A row counts as already present when its `site` + `product_id` matches a stored
+product, or when its brand and product name match one — so a hand-written row
+does not need an ID the retailer assigned. Matching folds case and punctuation
+the same way the brand filter does, so `AKIND` still matches `Akind`.
+Duplicates within the sheet itself are caught too, and a row with no
+`product_id` is given a stable generated one so re-uploading the same file
+cannot create a second copy.
+
+Only Supabase is consulted. The local CSV export is deliberately ignored: a
+product sitting in the file but missing from the database is exactly the row
+this is meant to insert.
+
+### Inserted rows get their own site
+
+A row with no `site` is filed under `manual` rather than a retailer, because
+the retailer pipeline would otherwise destroy it:
+
+- `merge_with_existing_sites` replaces one site's rows wholesale on every
+  export, so a manual row filed under `nykaa` disappears at the next Nykaa run.
+- `finalize_retailer_scrape_run` ages rows of the swept site that the sweep did
+  not see, so the same row would be counted missing and go inactive.
+
+Set the `site` column explicitly if you want a row to belong to a retailer
+anyway; the panel warns and names the sites affected. The default for rows that
+name no site is editable next to the uploader.
 
 ## CLI
 
@@ -374,6 +587,73 @@ structured `images` sheets, and a `reviews` sheet. Rows are deduplicated by
 Headers are frozen and bold, filters are enabled, prices are numeric rupee
 values, and widths are adjusted automatically.
 
+## Cross-platform comparison
+
+`build_comparison.py` matches the same product across platforms and writes one
+row per product with a price column per platform:
+
+```powershell
+python build_comparison.py --own data/roopsee_catalogue.csv
+python build_comparison.py --source csv --threshold 0.78
+python build_comparison.py --own catalogue.xlsx --brand "Minimalist, COSRX"
+```
+
+Retailer rows come from Supabase when it is configured, otherwise from
+`data/pricing_combined.csv` (`--source csv` forces the file). The own catalogue
+is any CSV or Excel export; its headers are matched by name, so a Shopify
+product export works unedited. `roopsee_catalogue.template.csv` shows the
+columns, of which only `brand`, `product_name`, and a price are required.
+
+### How products are matched
+
+No identifier is shared across platforms: only Nykaa publishes a usable GTIN,
+Tira exposes its internal item code, and Amazon India omits barcodes on beauty
+pages. Two rows with barcodes are matched on the barcode; everything else is
+matched on brand, pack size, and title wording, and a pair is rejected outright
+when it disagrees on any of:
+
+- **brand** — compared with the same key the scrape filter uses
+- **pack size** — `2 x 50 ml` never matches a single 100 ml bottle
+- **product form** — a sunscreen never matches a moisturiser
+- **concentration or SPF** — `Retinol 0.3%` never matches `Retinol 0.6%`
+- **kit vs single product** — a combo listing is its own item
+
+What survives is scored 0-1 from how much of the two titles overlap. The
+default `--threshold` is `0.70`; matches below `--review-below` (`0.80`) or
+carrying a caveat are copied to a `review` sheet, because a wrong pairing
+silently misreports a competitor's price. Each platform contributes at most one
+row per match, and every row is used at most once.
+
+### Output
+
+`data/comparison.xlsx` holds three sheets, and `data/comparison.csv` repeats
+the first one:
+
+- `comparison` — brand, product, form, size, then per platform the selling
+  price, MRP, discount, stock, name and URL, then `min_price`, `max_price`,
+  `price_gap`, `cheapest_platform`, and how the own catalogue compares
+  (`roopsee_vs_cheapest`)
+- `review` — the matches worth a human glance
+- `single_platform` — products found on only one platform, for gap analysis
+
+## Request pacing
+
+The retailer APIs answer in well under a second — measured medians are ~0.35s
+for a Nykaa detail call and ~0.9s for a Tira listing page — so throughput is
+decided entirely by `request.delay_*_seconds` and
+`request.max_requests_per_minute` in `config.yaml`, not by the network.
+
+The defaults are 0.5–1.5s delays under a 30/minute cap, which a bounded probe
+sustained at 32 requests/minute against Nykaa and Tira with no failures and no
+blocks. The previous 2–5s delays under a 12/minute cap left the scraper idle
+about 93% of the time and made a full Nykaa refresh an eight-hour job.
+
+Raise the cap in steps rather than in one jump, and check `Failures` and
+`Blocks` in the run summary afterwards. A cap that is too high is recoverable
+rather than free: soft blocks trigger backoff, checkpoints make the run
+resumable, and the only manual cost is re-copying the Nykaa cURL if its session
+is rejected.
+
 ## Reliability
 
 - Configurable random delays and global requests-per-minute limit
@@ -382,4 +662,15 @@ values, and widths are adjusted automatically.
 - Raw failed responses in `logs/failures/`
 - Page and product-level failure isolation
 - Resumable page/detail checkpoints
+- Checkpoint state is flushed to disk before it is renamed into place, and a
+  file left damaged by a crash is moved aside and rebuilt from the append-only
+  products and processed files rather than ending the run
+- Excel and CSV are written before the database is contacted, so a Supabase
+  outage cannot discard a collection that already ran
+- Idempotent Supabase writes are retried through transient timeouts and `5xx`
+  responses (`DATABASE_MAX_ATTEMPTS`, default 4). The end-of-sweep
+  `finalize_retailer_scrape_run` call is sent exactly once because it counts
+  how many sweeps have missed each product
+- Database snapshots are read with keyset pagination, so a growing table cannot
+  silently return a short catalogue to the nightly comparison
 - Completion status that distinguishes a finished run from a saved partial run

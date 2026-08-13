@@ -375,9 +375,17 @@ def export_products(
     csv_path: Path | None = None,
     *,
     sync_database: bool = False,
+    write_excel: bool = True,
     status_callback: Callable[[str], None] | None = None,
 ) -> ExportResult:
-    """Persist products to the database, Excel, and combined CSV."""
+    """Persist products to the database, Excel, and combined CSV.
+
+    ``write_excel=False`` writes the CSV and skips the workbook. Building the
+    workbook holds every cell in memory - around 500 MB for a ten-thousand
+    product catalogue - which a small hosted instance cannot afford, and on a
+    container with a temporary disk the file would not survive a restart
+    anyway.
+    """
     normalized = deduplicate(products)
     if not normalized:
         raise ValueError("No products are available to export.")
@@ -395,6 +403,48 @@ def export_products(
     for product in normalized:
         grouped.setdefault(product.site.casefold(), []).append(product)
 
+    if status_callback is not None:
+        status_callback(
+            f"Writing {len(normalized):,} products to "
+            + ("Excel and CSV..." if write_excel else "CSV...")
+        )
+
+    temporary_csv = combined_csv_path.with_name(
+        f".{combined_csv_path.stem}.tmp.csv"
+    )
+    try:
+        # The CSV is streamed row by row, so it costs almost no memory even for
+        # a large catalogue. Write it first: if the workbook cannot be built,
+        # the run still leaves a complete export behind.
+        with temporary_csv.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(OUTPUT_COLUMNS)
+            writer.writerows(_row(product) for product in normalized)
+        temporary_csv.replace(combined_csv_path)
+    finally:
+        temporary_csv.unlink(missing_ok=True)
+
+    if write_excel:
+        workbook = Workbook()
+        workbook.remove(workbook.active)
+        _add_sheet(workbook, "combined", normalized)
+        for site, site_products in sorted(grouped.items()):
+            _add_sheet(workbook, site, site_products)
+        _add_images_sheet(workbook, normalized)
+        _add_reviews_sheet(workbook, normalized)
+
+        temporary_excel = excel_path.with_name(f".{excel_path.stem}.tmp.xlsx")
+        try:
+            workbook.save(temporary_excel)
+            temporary_excel.replace(excel_path)
+        finally:
+            workbook.close()
+            temporary_excel.unlink(missing_ok=True)
+
+    # The database is synchronized only once the local files are on disk. With
+    # DATABASE_SYNC_REQUIRED set, a failed write still raises and still stops
+    # the run being called complete - but a transient Supabase timeout can no
+    # longer throw away the export of a collection that took hours.
     if status_callback is not None and sync_database:
         status_callback(
             f"Synchronizing {len(normalized):,} products with Supabase..."
@@ -404,35 +454,6 @@ def export_products(
         if sync_database
         else DatabaseSyncResult(enabled=False)
     )
-    if status_callback is not None:
-        status_callback(
-            f"Writing {len(normalized):,} products to Excel and CSV..."
-        )
-
-    workbook = Workbook()
-    workbook.remove(workbook.active)
-    _add_sheet(workbook, "combined", normalized)
-    for site, site_products in sorted(grouped.items()):
-        _add_sheet(workbook, site, site_products)
-    _add_images_sheet(workbook, normalized)
-    _add_reviews_sheet(workbook, normalized)
-
-    temporary_excel = excel_path.with_name(f".{excel_path.stem}.tmp.xlsx")
-    temporary_csv = combined_csv_path.with_name(
-        f".{combined_csv_path.stem}.tmp.csv"
-    )
-    try:
-        workbook.save(temporary_excel)
-        with temporary_csv.open("w", newline="", encoding="utf-8-sig") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(OUTPUT_COLUMNS)
-            writer.writerows(_row(product) for product in normalized)
-        temporary_excel.replace(excel_path)
-        temporary_csv.replace(combined_csv_path)
-    finally:
-        workbook.close()
-        temporary_excel.unlink(missing_ok=True)
-        temporary_csv.unlink(missing_ok=True)
 
     return ExportResult(
         excel_path=excel_path,

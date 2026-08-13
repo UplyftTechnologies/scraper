@@ -11,6 +11,7 @@ from pricing_scraper.clients.base import BaseJsonClient, parse_curl_command
 from pricing_scraper.clients.amazon import (
     AmazonClient,
     _asin,
+    _attribute_gtin,
     _count,
     _money,
     _search_asins_from_html,
@@ -827,6 +828,46 @@ class AmazonClientTests(unittest.TestCase):
         self.assertEqual(selling, 420)
         self.assertEqual(mrp, 599)
         self.assertEqual(discount, 30)
+
+
+class AmazonGtinTests(unittest.TestCase):
+    """Amazon India omits UPC/EAN rows, so the barcode comes from elsewhere."""
+
+    def test_an_explicit_barcode_row_wins(self):
+        self.assertEqual(
+            _attribute_gtin({"UPC": "8904417306224", "Item model number": "AQ-01"}),
+            "8904417306224",
+        )
+
+    def test_a_model_number_holding_a_real_ean_is_used(self):
+        # Verified against Nykaa's published barcode for the same product.
+        self.assertEqual(
+            _attribute_gtin({"Item model number": "8906087778462"}),
+            "8906087778462",
+        )
+        self.assertEqual(
+            _attribute_gtin({"Manufacturer Part Number": "8904417306224"}),
+            "8904417306224",
+        )
+
+    def test_a_short_model_number_is_never_a_barcode(self):
+        """``11502012`` passes the GTIN-8 check digit purely by chance.
+
+        Every eight-digit model number measured against Nykaa's published
+        barcode disagreed with it, so this length is refused outright.
+        """
+        self.assertEqual(_attribute_gtin({"Item model number": "11502012"}), "")
+
+    def test_a_padded_internal_code_is_refused(self):
+        # 099... falls in a GS1 range reserved for coupons and in-store codes.
+        self.assertEqual(_attribute_gtin({"Item model number": "992880990000"}), "")
+
+    def test_an_ordinary_model_number_is_ignored(self):
+        self.assertEqual(_attribute_gtin({"Item model number": "AQ-SUN-50G"}), "")
+        self.assertEqual(_attribute_gtin({"Item model number": "1234567890123"}), "")
+
+    def test_no_barcode_fields_at_all(self):
+        self.assertEqual(_attribute_gtin({"ASIN": "B09TPFTJNN"}), "")
 
 
 if __name__ == "__main__":

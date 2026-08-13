@@ -1,0 +1,3 @@
+site,product_id,brand,product_name,variant,sku,gtin,mrp,selling_price,in_stock,categories,product_url,image_url
+,,Minimalist,Niacinamide 10% Face Serum,30 ml,RS-0001,8904245701234,699,499,TRUE,Serums,https://example.com/products/niacinamide-serum,
+nykaa,,COSRX,Advanced Snail 96 Mucin Power Essence,100 ml,,8809416470009,1500,1350,TRUE,Serums,,
