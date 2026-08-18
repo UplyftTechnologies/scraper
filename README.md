@@ -561,6 +561,41 @@ category it performs a capped beauty search, opens the discovered public
 product pages, and follows selectable size ASINs up to
 `max_variants_per_product`.
 
+#### Searching by brand as well as by category
+
+Amazon has no catalogue to paginate, so a category is approximated by a generic
+search — `face serum skincare` — and Amazon answers with whatever it ranks
+highest. Your brands are never named in the query, so a brand that does not
+happen to rank is never seen. Measured against a 207-brand filter, category
+searches alone returned products for **50 brands**, and eight of fifteen
+categories stopped at `max_products_per_category` rather than because Amazon
+had run out.
+
+Each configured brand is therefore also searched by name, which asks Amazon for
+that brand's own catalogue:
+
+```yaml
+amazon:
+  brand_search:
+    enabled: true
+    page_limit: 2
+    max_products_per_brand: 40
+```
+
+Both sets of results are merged by ASIN, so a product found twice is fetched
+once. The discovery ceiling rises from `17 × 40 = 680` products to roughly
+9,000 before deduplication and the brand filter, at the cost of 448 search
+pages instead of 34.
+
+A product found by brand search has no category, because no category asked for
+it. Its labels are inferred from the same category queries by matching their
+distinctive words against the product's title and generic name; words that
+appear in nearly every query (`skincare`, `face`, `beauty`) are ignored, and a
+product matching nothing keeps an empty category list rather than being forced
+into one it is not in.
+
+Set `brand_search.enabled: false` to return to category searches only.
+
 The browser first opens Amazon's storefront and retains that session's cookies
 for search and product requests. A failed or blocked attempt is retried from a
 fresh context. This prevents Amazon's normal `202` storefront warm-up and

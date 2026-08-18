@@ -6,9 +6,10 @@ import csv
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping, Sequence
 
 from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -245,46 +246,94 @@ def _row(product: Product, *, excel: bool = False) -> list[object]:
     ]
 
 
-def _format_sheet(sheet: Worksheet) -> None:
+RUPEES = "₹#,##0.00"
+PERCENT = '0.00"%"'
+
+
+class _Widths:
+    """Track the widest value seen per column while the rows are written.
+
+    Sizing columns afterwards meant walking every cell in the sheet a second
+    time through openpyxl, which for a ten-thousand product catalogue is
+    millions of Python-level cell reads and took the better part of an hour.
+    The values are already in hand as each row is appended, so their lengths
+    are measured then and nothing is re-read.
+    """
+
+    __slots__ = ("widest",)
+
+    def __init__(self, headers: Sequence[str]) -> None:
+        self.widest = [len(str(header)) for header in headers]
+
+    def observe(self, values: Sequence[object]) -> None:
+        widest = self.widest
+        for index, value in enumerate(values):
+            if value is None or index >= len(widest):
+                continue
+            length = len(value) if isinstance(value, str) else len(str(value))
+            if length > widest[index]:
+                widest[index] = length
+
+    def apply(self, sheet: Worksheet) -> None:
+        for index, width in enumerate(self.widest, start=1):
+            sheet.column_dimensions[get_column_letter(index)].width = min(
+                max(width + 2, 10), 60
+            )
+
+
+def _style_header(sheet: Worksheet, widths: _Widths) -> None:
+    """Freeze and style the header, then size the columns that were measured."""
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
     header_fill = PatternFill("solid", fgColor="D81B60")
     for cell in sheet[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = header_fill
+    widths.apply(sheet)
 
-    headers = {
-        str(cell.value): cell.column
-        for cell in sheet[1]
-        if cell.value is not None
-    }
-    price_columns = {
-        headers[name]
-        for name in ("mrp", "selling_price")
-        if name in headers
-    }
-    discount_column = headers.get("discount_pct")
-    for row in sheet.iter_rows(min_row=2):
-        for column in price_columns:
-            row[column - 1].number_format = '₹#,##0.00'
-        if discount_column is not None:
-            row[discount_column - 1].number_format = '0.00"%"'
 
-    for column_cells in sheet.columns:
-        letter = column_cells[0].column_letter
-        width = max(
-            len(str(cell.value)) if cell.value is not None else 0
-            for cell in column_cells
-        )
-        sheet.column_dimensions[letter].width = min(max(width + 2, 10), 60)
+def _number_format_columns(headers: Sequence[str]) -> dict[int, str]:
+    """Which one-based columns need a currency or percentage format."""
+    formats: dict[int, str] = {}
+    for index, header in enumerate(headers, start=1):
+        if header in ("mrp", "selling_price"):
+            formats[index] = RUPEES
+        elif header == "discount_pct":
+            formats[index] = PERCENT
+    return formats
+
+
+def _append_row(
+    sheet: Worksheet,
+    values: Sequence[object],
+    widths: _Widths,
+    formats: Mapping[int, str],
+    row: int,
+) -> None:
+    """Append one row, measuring it and formatting only the cells that need it.
+
+    The row number is passed in rather than read back from the sheet.
+    ``Worksheet.max_row`` looks like a cheap attribute but rebuilds a set of
+    every populated cell's row index on each access, so asking for it once per
+    row turns writing a sheet into quadratic work.
+    """
+    sheet.append(list(values))
+    widths.observe(values)
+    for column, number_format in formats.items():
+        # Three cells per row rather than every cell in the sheet.
+        sheet.cell(row=row, column=column).number_format = number_format
 
 
 def _add_sheet(workbook: Workbook, name: str, products: Iterable[Product]) -> None:
     sheet = workbook.create_sheet(title=name[:31])
     sheet.append(list(OUTPUT_COLUMNS))
+    widths = _Widths(OUTPUT_COLUMNS)
+    formats = _number_format_columns(OUTPUT_COLUMNS)
+    row_number = 1  # the header
     for product in products:
-        sheet.append(_row(product, excel=True))
-    _format_sheet(sheet)
+        row_number += 1
+        _append_row(sheet, _row(product, excel=True), widths, formats, row_number)
+    _style_header(sheet, widths)
 
 
 def _add_images_sheet(
@@ -295,6 +344,8 @@ def _add_images_sheet(
     sheets: list[Worksheet] = [workbook.create_sheet(title="images")]
     sheets[0].append(list(IMAGE_COLUMNS))
     sheet = sheets[0]
+    widths = [_Widths(IMAGE_COLUMNS)]
+    rows_on_sheet = 1  # the header
     seen: set[tuple[str, str, str]] = set()
     for product in products:
         urls = product.image_urls or (
@@ -308,25 +359,28 @@ def _add_images_sheet(
                 continue
             seen.add(key)
             position += 1
-            if sheet.max_row >= EXCEL_MAX_ROWS:
+            if rows_on_sheet >= EXCEL_MAX_ROWS:
                 sheet = workbook.create_sheet(
                     title=f"images_{len(sheets) + 1}"
                 )
                 sheet.append(list(IMAGE_COLUMNS))
                 sheets.append(sheet)
-            sheet.append(
-                [
-                    product.site,
-                    product.parent_product_id,
-                    product.product_id,
-                    product.sku,
-                    product.variant,
-                    position,
-                    text,
-                ]
-            )
-    for image_sheet in sheets:
-        _format_sheet(image_sheet)
+                widths.append(_Widths(IMAGE_COLUMNS))
+                rows_on_sheet = 1
+            row = [
+                product.site,
+                product.parent_product_id,
+                product.product_id,
+                product.sku,
+                product.variant,
+                position,
+                text,
+            ]
+            sheet.append(row)
+            widths[-1].observe(row)
+            rows_on_sheet += 1
+    for image_sheet, image_widths in zip(sheets, widths):
+        _style_header(image_sheet, image_widths)
 
 
 def _add_reviews_sheet(
@@ -336,6 +390,7 @@ def _add_reviews_sheet(
     """Write highlighted PDP reviews once per parent/review ID."""
     sheet = workbook.create_sheet(title="reviews")
     sheet.append(list(REVIEW_COLUMNS))
+    widths = _Widths(REVIEW_COLUMNS)
     seen: set[tuple[str, str, str]] = set()
     for product in products:
         parent_id = product.parent_product_id or product.product_id
@@ -351,22 +406,22 @@ def _add_reviews_sheet(
             if key in seen:
                 continue
             seen.add(key)
-            sheet.append(
-                [
-                    product.site,
-                    parent_id,
-                    review_id,
-                    review.get("rating"),
-                    review.get("title"),
-                    review.get("review"),
-                    review.get("reviewer"),
-                    review.get("verified_buyer"),
-                    review.get("created_at"),
-                    review.get("likes"),
-                    _cell_value(review.get("images", []), excel=True),
-                ]
-            )
-    _format_sheet(sheet)
+            row = [
+                product.site,
+                parent_id,
+                review_id,
+                review.get("rating"),
+                review.get("title"),
+                review.get("review"),
+                review.get("reviewer"),
+                review.get("verified_buyer"),
+                review.get("created_at"),
+                review.get("likes"),
+                _cell_value(review.get("images", []), excel=True),
+            ]
+            sheet.append(row)
+            widths.observe(row)
+    _style_header(sheet, widths)
 
 
 def export_products(

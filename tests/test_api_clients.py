@@ -872,3 +872,59 @@ class AmazonGtinTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AmazonBrandSearchTests(unittest.TestCase):
+    """Category searches only reach brands Amazon chooses to rank."""
+
+    CATEGORIES = [
+        {"name": "Sun Care", "query": "sunscreen skincare"},
+        {"name": "Serums", "query": "face serum skincare"},
+        {"name": "Cleansers", "query": "face cleanser skincare"},
+        {"name": "Eye Care", "query": "eye care skincare"},
+    ]
+
+    def infer(self, name, **extra):
+        product = Product(
+            site="amazon",
+            product_id="A1",
+            brand="Brand",
+            product_name=name,
+            **extra,
+        )
+        return AmazonClient.infer_categories(product, self.CATEGORIES)
+
+    def test_a_product_is_labelled_from_the_category_wording(self):
+        self.assertEqual(self.infer("Aqualogica Dewy Sunscreen SPF 50"), ["Sun Care"])
+        self.assertEqual(
+            self.infer("Minimalist Vitamin C Serum 10%"), ["Serums"]
+        )
+
+    def test_generic_words_alone_never_label_a_product(self):
+        """Almost every query says 'skincare' and 'face', so they mean nothing."""
+        self.assertEqual(self.infer("Some Skincare Product For Face"), [])
+
+    def test_a_product_matching_nothing_stays_unlabelled(self):
+        # Better an empty list than a category the product is not in.
+        self.assertEqual(self.infer("Hair Oil 200ml"), [])
+
+    def test_a_product_can_match_several_categories(self):
+        self.assertEqual(
+            sorted(self.infer("Cleanser and Serum Duo")),
+            ["Cleansers", "Serums"],
+        )
+
+    def test_the_generic_name_attribute_is_considered(self):
+        self.assertEqual(
+            self.infer(
+                "Aqualogica Glow+ 50g",
+                product_attributes={"Generic Name": "Sunscreen"},
+            ),
+            ["Sun Care"],
+        )
+
+    def test_brand_names_are_kept_for_searching(self):
+        client = AmazonClient.__new__(AmazonClient)
+        client.brand_names = ["COSRX", "d'Alba Piedmont"]
+        # The names must survive as written; the folded key cannot be searched.
+        self.assertEqual(client.brand_names, ["COSRX", "d'Alba Piedmont"])

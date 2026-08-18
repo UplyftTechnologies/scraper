@@ -94,3 +94,129 @@ class BrandFilterEnvironmentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProgressReporterTests(unittest.TestCase):
+    """A run takes hours; the operator needs to see where it is."""
+
+    def reporter(self, **kwargs):
+        from pricing_scraper.cli import ProgressReporter
+
+        return ProgressReporter("nykaa", interval_seconds=0, **kwargs)
+
+    def test_it_reports_position_percentage_and_elapsed(self):
+        from io import StringIO
+        from contextlib import redirect_stdout
+
+        out = StringIO()
+        with redirect_stdout(out):
+            self.reporter(position="1/3")("details", 25, 100, "working")
+        line = out.getvalue()
+        self.assertIn("1/3 nykaa", line)
+        self.assertIn("25/100", line)
+        self.assertIn("(25%)", line)
+        self.assertIn("elapsed", line)
+
+    def test_an_estimate_needs_a_baseline_first(self):
+        """One sample says nothing about the rate, so no estimate is offered."""
+        from io import StringIO
+        from contextlib import redirect_stdout
+
+        reporter = self.reporter()
+        out = StringIO()
+        with redirect_stdout(out):
+            reporter("details", 10, 100, "first")
+        self.assertNotIn("left", out.getvalue())
+
+        out = StringIO()
+        reporter._stage_started -= 60
+        with redirect_stdout(out):
+            reporter("details", 60, 100, "later")
+        self.assertIn("left", out.getvalue())
+
+    def test_a_new_stage_is_timed_from_scratch(self):
+        """Stages move at different speeds, so one cannot estimate the next."""
+        reporter = self.reporter()
+        reporter("listing", 5, 17, "a")
+        first_started = reporter._stage_started
+        reporter("details", 0, 5000, "b")
+        self.assertNotEqual(reporter._stage_started, first_started)
+        self.assertEqual(reporter._stage_first, 0)
+
+    def test_a_stage_with_no_total_still_reports(self):
+        from io import StringIO
+        from contextlib import redirect_stdout
+
+        out = StringIO()
+        with redirect_stdout(out):
+            self.reporter()("sku_rows", 1512, 0, "rows ready")
+        line = out.getvalue()
+        self.assertIn("1,512", line)
+        self.assertNotIn("%", line)
+
+    def test_durations_read_the_way_a_person_would_say_them(self):
+        from pricing_scraper.cli import _duration
+
+        self.assertEqual(_duration(12), "12s")
+        self.assertEqual(_duration(95), "1m")
+        self.assertEqual(_duration(2500), "41m")
+        self.assertEqual(_duration(11400), "3h 10m")
+
+
+class SampleModeTests(unittest.TestCase):
+    """A tiny run must not be able to replace the real catalogue."""
+
+    def args(self, **overrides):
+        import argparse
+
+        values = {"sample": 2, "output": None}
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def base_config(self):
+        return {
+            "nykaa": {"page_limit": 700},
+            "tira": {"page_limit": 200},
+            "amazon": {"search_page_limit": 2},
+            "database": {"enabled": True},
+            "output": {
+                "excel_path": "data/pricing.xlsx",
+                "combined_csv_path": "data/pricing_combined.csv",
+            },
+        }
+
+    def test_the_database_is_switched_off(self):
+        """Exporting two products would otherwise shrink the site to two rows."""
+        from pricing_scraper.cli import _apply_sample_mode
+
+        config = self.base_config()
+        _apply_sample_mode(self.args(), config)
+        self.assertFalse(config["database"]["enabled"])
+
+    def test_output_is_redirected_away_from_the_real_files(self):
+        from pathlib import Path
+
+        from pricing_scraper.cli import _apply_sample_mode
+
+        args = self.args()
+        _apply_sample_mode(args, self.base_config())
+        self.assertIn("sample", str(args.output))
+        self.assertNotEqual(Path(args.output), Path("data/pricing.xlsx"))
+
+    def test_an_explicit_output_is_respected(self):
+        from pathlib import Path
+
+        from pricing_scraper.cli import _apply_sample_mode
+
+        args = self.args(output=Path("somewhere/mine.xlsx"))
+        _apply_sample_mode(args, self.base_config())
+        self.assertEqual(args.output, Path("somewhere/mine.xlsx"))
+
+    def test_page_limits_drop_to_one(self):
+        from pricing_scraper.cli import _apply_sample_mode
+
+        config = self.base_config()
+        _apply_sample_mode(self.args(), config)
+        self.assertEqual(config["nykaa"]["page_limit"], 1)
+        self.assertEqual(config["tira"]["page_limit"], 1)
+        self.assertEqual(config["amazon"]["search_page_limit"], 1)

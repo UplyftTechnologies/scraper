@@ -287,9 +287,23 @@ class AmazonClient:
         self.max_requests_per_minute = max(
             1, int(request_config.get("max_requests_per_minute", 12))
         )
+        # Keep the names as written, not only their folded keys: Amazon has no
+        # catalogue to paginate, so the brands have to be searched for by name.
+        self.brand_names = [
+            _text(brand) for brand in brands if _text(brand)
+        ]
         self.brand_filter = {
             brand_key(brand) for brand in brands if brand_key(brand)
         }
+        brand_search = site_config.get("brand_search")
+        brand_search = brand_search if isinstance(brand_search, Mapping) else {}
+        self.brand_search_enabled = bool(brand_search.get("enabled", True))
+        self.brand_search_page_limit = max(
+            1, int(brand_search.get("page_limit", 2))
+        )
+        self.max_products_per_brand = max(
+            1, int(brand_search.get("max_products_per_brand", 40))
+        )
         self.logs_dir = Path(
             str(request_config.get("logs_dir") or "logs")
         ).resolve()
@@ -795,6 +809,82 @@ class AmazonClient:
         return urls
 
     @staticmethod
+    def infer_categories(
+        product: Product,
+        categories: Sequence[Mapping[str, Any]],
+    ) -> list[str]:
+        """Label a brand-discovered product using the category search wording.
+
+        A product found by searching its brand arrives with no category, since
+        no category asked for it. The configured queries already describe each
+        category in plain words, so the distinctive ones are matched against
+        the product's own title and type. A product that matches nothing keeps
+        an empty list rather than being forced into a category it is not in.
+        """
+        haystack = " ".join(
+            part.casefold()
+            for part in (
+                product.product_name,
+                product.variant,
+                str(product.product_attributes.get("Generic Name", "")),
+                str(product.product_attributes.get("Item Form", "")),
+            )
+            if part
+        )
+        if not haystack:
+            return []
+        # "skincare" and "face" appear in nearly every query, so they say
+        # nothing about which category a product belongs to.
+        ignored = {"skincare", "skin", "care", "face", "beauty", "recommended"}
+        matched: list[str] = []
+        for category in categories:
+            name = _text(category.get("name"))
+            words = [
+                word
+                for word in _text(category.get("query")).casefold().split()
+                if word not in ignored and len(word) > 2
+            ]
+            if words and any(word in haystack for word in words):
+                matched.append(name)
+        return matched
+
+    def discover_brand_urls(self, brand: str) -> list[str]:
+        """Discover product URLs by searching Amazon for one brand by name.
+
+        The configured category searches use generic wording - "face serum
+        skincare" - so Amazon answers with whatever it ranks highest, and a
+        brand that does not happen to rank is never seen at all. Searching the
+        brand name instead asks Amazon for that brand's own catalogue, which is
+        the only way to reach the long tail of a large brand list.
+        """
+        query = quote_plus(f"{_text(brand)}")
+        urls: list[str] = []
+        for page_number in range(1, self.brand_search_page_limit + 1):
+            url = (
+                "https://www.amazon.in/s?"
+                f"k={query}&i=beauty&page={page_number}"
+            )
+            try:
+                page_urls = self._browse(url, self._discover_search_page)
+            except Exception as exc:  # noqa: BLE001 - one brand must not stop the sweep
+                self.page_failures += 1
+                self.logger.error(
+                    "amazon_brand_search brand=%s page=%s failed=%s",
+                    brand,
+                    page_number,
+                    exc,
+                )
+                break
+            for product_url in page_urls:
+                if product_url not in urls:
+                    urls.append(product_url)
+                if len(urls) >= self.max_products_per_brand:
+                    return urls
+            if not page_urls:
+                break
+        return urls
+
+    @staticmethod
     def _attributes(page: Page) -> dict[str, str]:
         attributes: dict[str, str] = {}
         selectors = (
@@ -1237,8 +1327,15 @@ class AmazonClient:
         processed_asins: Iterable[str] = (),
         on_product: Callable[[Product], None] | None = None,
         progress_callback: ProgressCallback | None = None,
+        max_products: int = 0,
     ) -> AmazonScrapeResult:
-        """Discover category products and collect normalized product details."""
+        """Discover category products and collect normalized product details.
+
+        ``max_products`` stops the walk once that many products have been
+        collected. Capping the result afterwards is not enough: every page is
+        a browser load taking seconds, so a smoke test asking for two products
+        would still spend a quarter of an hour opening seventy.
+        """
         asin_categories: dict[str, set[str]] = {}
         discovery_failed = False
         for category_index, category in enumerate(categories, start=1):
@@ -1268,6 +1365,38 @@ class AmazonClient:
                     f"{len(asin_categories):,} unique Amazon ASINs discovered",
                 )
 
+        # Category searches only surface what Amazon chooses to rank, so most
+        # of a large brand list is never reached by them. Search each brand by
+        # name as well; the two sets overlap and are merged by ASIN.
+        if self.brand_search_enabled and self.brand_names:
+            for brand_index, brand in enumerate(self.brand_names, start=1):
+                if progress_callback is not None:
+                    progress_callback(
+                        "listing",
+                        brand_index - 1,
+                        len(self.brand_names),
+                        f"Amazon brand search {brand_index}/"
+                        f"{len(self.brand_names)}: {brand}",
+                    )
+                try:
+                    urls = self.discover_brand_urls(brand)
+                except Exception:  # noqa: BLE001 - one brand must not stop the run
+                    self.page_failures += 1
+                    urls = []
+                for url in urls:
+                    asin = _asin(url)
+                    if asin:
+                        # No category label: the search was by brand, so the
+                        # label is inferred from the product page once fetched.
+                        asin_categories.setdefault(asin, set())
+                if progress_callback is not None:
+                    progress_callback(
+                        "listing_products",
+                        len(asin_categories),
+                        0,
+                        f"{len(asin_categories):,} unique Amazon ASINs discovered",
+                    )
+
         for configured in self.products_config:
             if isinstance(configured, Mapping):
                 value = _text(
@@ -1291,6 +1420,8 @@ class AmazonClient:
         completed_now = 0
         index = 0
         while index < len(queue):
+            if max_products and completed_now >= max_products:
+                break
             asin = queue[index]
             index += 1
             if asin in processed:
@@ -1308,6 +1439,12 @@ class AmazonClient:
                 ):
                     processed.add(asin)
                     continue
+                if not product.categories:
+                    # Found by brand search, so no category asked for it.
+                    inferred = self.infer_categories(product, categories)
+                    if inferred:
+                        product.categories = inferred
+                        labels = inferred
                 products.append(product)
                 processed.add(asin)
                 completed_now += 1

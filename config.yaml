@@ -203,6 +203,20 @@ amazon:
   browser_channel: chrome
   search_page_limit: 2
   max_products_per_category: 40
+  # Amazon has no catalogue to paginate, so the category searches below use
+  # generic wording and Amazon answers with whatever it ranks highest. That
+  # reaches only the brands that happen to rank: a 207-brand filter returned
+  # products for 50 of them, and eight categories stopped at the 40-product
+  # cap rather than because Amazon ran out.
+  #
+  # Searching each brand by name asks Amazon for that brand's own catalogue,
+  # which is the only way to reach the rest. Both sets of results are merged
+  # by ASIN, and a product found by brand gets its category labels inferred
+  # from the category queries below.
+  brand_search:
+    enabled: true
+    page_limit: 2
+    max_products_per_brand: 40
   max_variants_per_product: 12
   navigation_timeout_ms: 45000
   search_result_timeout_ms: 12000

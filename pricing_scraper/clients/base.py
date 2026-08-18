@@ -175,6 +175,30 @@ class RequestRateLimiter:
             self._request_times.append(self.clock())
 
 
+# How much of the request log reaches the console. The file always gets
+# everything; the console is a different audience. A foreground run prints two
+# lines per request, which at the rate limit is sixty lines a minute and buries
+# the progress the operator is actually watching for. The CLI lowers this to
+# WARNING so only real problems interrupt, and restores INFO with --verbose.
+# The detached worker leaves it at INFO, because its console *is* the run log
+# the dashboard reads back.
+CONSOLE_LOG_LEVEL = logging.INFO
+
+
+def set_console_log_level(level: int) -> None:
+    """Set how verbose the console is, for loggers built from now on and already."""
+    global CONSOLE_LOG_LEVEL
+    CONSOLE_LOG_LEVEL = level
+    for logger in logging.Logger.manager.loggerDict.values():
+        if not isinstance(logger, logging.Logger):
+            continue
+        for handler in logger.handlers:
+            if isinstance(handler, logging.StreamHandler) and not isinstance(
+                handler, logging.FileHandler
+            ):
+                handler.setLevel(level)
+
+
 def build_logger(name: str, logs_dir: Path) -> logging.Logger:
     """Create an idempotent console and file logger."""
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -191,6 +215,7 @@ def build_logger(name: str, logs_dir: Path) -> logging.Logger:
         file_handler.setFormatter(formatter)
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(formatter)
+        console_handler.setLevel(CONSOLE_LOG_LEVEL)
         logger.addHandler(file_handler)
         logger.addHandler(console_handler)
     return logger

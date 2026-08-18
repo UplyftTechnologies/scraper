@@ -155,7 +155,15 @@ class BackgroundRunTests(unittest.TestCase):
                 "run-6", {"heartbeat": stale.isoformat()}, root=root, heartbeat=False
             )
 
-            status = active_status(root)
+            # Pin the boot time. _death_reason checks "did the machine reboot
+            # since the heartbeat" first, so on a freshly booted machine that
+            # check claims the run instead and the assertion below never sees
+            # the reason it is testing.
+            with patch(
+                "pricing_scraper.background._system_boot_time",
+                return_value=None,
+            ):
+                status = active_status(root)
 
             self.assertEqual(status["state"], "failed")
             self.assertIn("stopped reporting progress", status["error"])

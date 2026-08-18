@@ -586,3 +586,58 @@ class RefreshReuseTests(unittest.TestCase):
                 )
 
         self.assertEqual(self.FakeNykaaClient.detail_calls, ["sku-1"])
+
+
+class FinalSyncTests(unittest.TestCase):
+    """Streaming only covers what a run actually scraped."""
+
+    class Sink:
+        def __init__(self, written=0, failures=0):
+            from pricing_scraper.db_sink import SinkResult
+
+            self.result = SinkResult(
+                enabled=True, products_written=written, failures=failures
+            )
+
+    def config(self, enabled=True):
+        return {"database": {"enabled": enabled}}
+
+    def test_streaming_that_covered_the_export_needs_no_sync(self):
+        from pricing_scraper.dashboard_service import _needs_final_sync
+
+        self.assertFalse(
+            _needs_final_sync(self.config(), self.Sink(written=100), 100)
+        )
+
+    def test_a_checkpoint_reused_run_still_needs_the_sync(self):
+        """It streams almost nothing because almost nothing was scraped.
+
+        Skipping the sync then leaves the export in the files and never in the
+        database.
+        """
+        from pricing_scraper.dashboard_service import _needs_final_sync
+
+        self.assertTrue(
+            _needs_final_sync(self.config(), self.Sink(written=1), 10_721)
+        )
+
+    def test_a_failed_batch_forces_the_reconciling_sync(self):
+        from pricing_scraper.dashboard_service import _needs_final_sync
+
+        self.assertTrue(
+            _needs_final_sync(
+                self.config(), self.Sink(written=100, failures=1), 100
+            )
+        )
+
+    def test_no_sink_means_the_export_must_do_it(self):
+        from pricing_scraper.dashboard_service import _needs_final_sync
+
+        self.assertTrue(_needs_final_sync(self.config(), None, 100))
+
+    def test_a_disabled_database_is_never_written(self):
+        from pricing_scraper.dashboard_service import _needs_final_sync
+
+        self.assertFalse(
+            _needs_final_sync(self.config(enabled=False), None, 100)
+        )

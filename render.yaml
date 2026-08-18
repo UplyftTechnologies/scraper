@@ -34,14 +34,22 @@ services:
       - key: TIRA_APPLICATION_TOKEN
         sync: false
 
+  # Midnight IST is 18:30 UTC. One job, in order: every retailer refreshed,
+  # then barcodes propagated between them. The order matters - propagating
+  # before the refresh would spread yesterday's catalogue.
+  #
+  # Amazon is absent on purpose: the image installs no browser, so an Amazon
+  # leg would fail every night. Run it locally instead.
   - type: cron
-    name: beauty-nykaa-nightly
+    name: beauty-nightly
     runtime: docker
     plan: starter
-    schedule: "0 19 * * *"
+    schedule: "30 18 * * *"
     dockerfilePath: ./Dockerfile
-    dockerCommand: python -m pricing_scraper.scheduler --site nykaa --config config.yaml
+    dockerCommand: python -m pricing_scraper.nightly --threshold 1.0 --config config.yaml
     envVars:
+      - key: HOSTED_DASHBOARD
+        value: "true"
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SECRET_KEY
@@ -54,26 +62,24 @@ services:
         sync: false
       - key: NYKAA_CURL_COMMAND
         sync: false
+      - key: TIRA_APPLICATION_ID
+        sync: false
+      - key: TIRA_APPLICATION_TOKEN
+        sync: false
 
+  # Exits non-zero when a run is stuck, a schedule was missed, or the data has
+  # gone stale, so Render surfaces it as a failed job rather than staying quiet.
   - type: cron
-    name: beauty-tira-nightly
+    name: beauty-watchdog
     runtime: docker
     plan: starter
-    schedule: "0 20 * * *"
+    schedule: "0 */6 * * *"
     dockerfilePath: ./Dockerfile
-    dockerCommand: python -m pricing_scraper.scheduler --site tira --config config.yaml
+    dockerCommand: python -m pricing_scraper.watchdog --config config.yaml
     envVars:
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SECRET_KEY
         sync: false
-      - key: DATABASE_SYNC_REQUIRED
-        value: "true"
       - key: SUPABASE_RUNS_TABLE
         value: retailer_scrape_runs
-      - key: SCRAPE_BRANDS
-        sync: false
-      - key: TIRA_APPLICATION_ID
-        sync: false
-      - key: TIRA_APPLICATION_TOKEN
-        sync: false

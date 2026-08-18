@@ -119,19 +119,26 @@ def _close_sink(sink: Any, *, complete_sweep: bool) -> Any:
     return sink.close(complete_sweep=complete_sweep)
 
 
-def _needs_final_sync(run_config: dict[str, Any], sink: Any) -> bool:
+def _needs_final_sync(
+    run_config: dict[str, Any], sink: Any, exporting: int = 0
+) -> bool:
     """Whether the export still has to push the whole catalogue.
 
-    When streaming worked there is nothing left to send: every product already
-    went up in batches as it was scraped. A failed batch is the exception - the
-    full sync then acts as the reconciliation pass, which is worth its cost
-    precisely because something was missed.
+    Streaming covers a run that actually scrapes: every product goes up in
+    batches as it is collected. Two cases still need the full sync.
+
+    A failed batch, where the sync becomes the reconciliation pass. And a run
+    that reused most of its work from checkpoints - it streams almost nothing,
+    because nothing was newly scraped, so skipping the sync would leave the
+    export in the files and never in the database.
     """
     if not _database_sync_enabled(run_config):
         return False
     if sink is None:
         return True
-    return sink.result.failures > 0
+    if sink.result.failures:
+        return True
+    return sink.result.products_written < exporting
 
 
 def _parent_id(product: Product) -> str:
@@ -331,6 +338,7 @@ def collect_nykaa(
     resume: bool = True,
     enrich_details: bool | None = None,
     refresh_only_stale: bool | None = None,
+    sample_limit: int = 0,
     progress_callback: ProgressCallback | None = None,
     sleeper: Callable[[float], None] | None = None,
 ) -> CollectionResult:
@@ -498,6 +506,9 @@ def collect_nykaa(
             listing_products.extend(category_products)
 
         listing_products = deduplicate(listing_products)
+        if sample_limit:
+            # A smoke test wants proof the pipeline works, not the catalogue.
+            listing_products = listing_products[:sample_limit]
         if not listing_products:
             raise ValueError(
                 "Nykaa returned no products. Check the selected categories "
@@ -669,6 +680,10 @@ def collect_nykaa(
                 if parent_id in unprocessed
             ]
             final_products = deduplicate([*enriched, *fallback])
+            if sample_limit:
+                # The detail checkpoint replays everything an earlier run
+                # stored, so truncating the listing alone is not enough.
+                final_products = final_products[:sample_limit]
             if progress_callback is not None:
                 progress_callback(
                     "details",
@@ -692,7 +707,9 @@ def collect_nykaa(
             combined_products,
             excel_path,
             csv_path,
-            sync_database=_needs_final_sync(run_config, sink),
+            sync_database=_needs_final_sync(
+                run_config, sink, len(combined_products)
+            ),
             write_excel=_write_excel_here(),
             status_callback=_export_status_callback(progress_callback),
         )
@@ -729,6 +746,7 @@ def collect_tira(
     resume: bool = True,
     enrich_details: bool | None = None,
     refresh_only_stale: bool | None = None,
+    sample_limit: int = 0,
     progress_callback: ProgressCallback | None = None,
     sleeper: Callable[[float], None] | None = None,
 ) -> CollectionResult:
@@ -886,6 +904,9 @@ def collect_tira(
             listing_products.extend(store.load_products())
 
         listing_products = deduplicate(listing_products)
+        if sample_limit:
+            # A smoke test wants proof the pipeline works, not the catalogue.
+            listing_products = listing_products[:sample_limit]
         if not listing_products:
             raise ValueError(
                 "Tira returned no products. Check the selected collections "
@@ -1019,6 +1040,8 @@ def collect_tira(
             final_products = deduplicate(
                 [*listing_products, *detail_store.load_products()]
             )
+            if sample_limit:
+                final_products = final_products[:sample_limit]
 
         completed = listing_completed and details_completed
         excel_path, csv_path = _output_paths(run_config, output_path)
@@ -1032,7 +1055,9 @@ def collect_tira(
             combined_products,
             excel_path,
             csv_path,
-            sync_database=_needs_final_sync(run_config, sink),
+            sync_database=_needs_final_sync(
+                run_config, sink, len(combined_products)
+            ),
             write_excel=_write_excel_here(),
             status_callback=_export_status_callback(progress_callback),
         )
@@ -1092,6 +1117,7 @@ def collect_amazon(
     resume: bool = True,
     enrich_details: bool | None = None,
     refresh_only_stale: bool | None = None,
+    sample_limit: int = 0,
     progress_callback: ProgressCallback | None = None,
     sleeper: Callable[[float], None] | None = None,
 ) -> CollectionResult:
@@ -1101,6 +1127,11 @@ def collect_amazon(
     run_config = copy.deepcopy(config)
     refresh_policy = RefreshPolicy.from_config(run_config, enabled=refresh_only_stale)
     run_config["amazon"]["search_page_limit"] = max(1, int(page_limit))
+    if sample_limit:
+        # A smoke test opens a handful of pages, not the catalogue. Brand
+        # search alone would be 207 searches before a single product page.
+        run_config["amazon"]["max_products_per_category"] = sample_limit
+        run_config["amazon"]["brand_search"] = {"enabled": False}
     sink, _run_id = _open_run_sink("amazon", run_config)
     requested_categories = list(categories)
     scope_source = (
@@ -1163,10 +1194,16 @@ def collect_amazon(
             processed_asins=skip_asins,
             on_product=save_product,
             progress_callback=progress_callback,
+            max_products=sample_limit,
         )
         final_products = deduplicate(
             [*resumed, *detail_store.load_products()]
         )
+        if sample_limit:
+            # Amazon has no listing pass to truncate: its products come from
+            # the checkpoint, which replays every ASIN an earlier run stored.
+            # Capping discovery alone let a sample return 793 products.
+            final_products = final_products[:sample_limit]
         if not final_products:
             if client.blocks_encountered:
                 raise ValueError(
@@ -1198,7 +1235,9 @@ def collect_amazon(
             combined_products,
             excel_path,
             csv_path,
-            sync_database=_needs_final_sync(run_config, sink),
+            sync_database=_needs_final_sync(
+                run_config, sink, len(combined_products)
+            ),
             write_excel=_write_excel_here(),
             status_callback=_export_status_callback(progress_callback),
         )

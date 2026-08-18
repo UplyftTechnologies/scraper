@@ -68,7 +68,6 @@ class DatabaseSink:
     batch_size: int = DEFAULT_BATCH
     logger: logging.Logger = LOGGER
     _buffer: list[Product] = field(default_factory=list)
-    _seen: set[str] = field(default_factory=set)
     result: SinkResult = field(default_factory=SinkResult)
 
     def __post_init__(self) -> None:
@@ -96,11 +95,27 @@ class DatabaseSink:
             self._flush(self._buffer)
             self._buffer.clear()
 
+    @staticmethod
+    def _latest_per_product(products: Sequence[Product]) -> list[Product]:
+        """Keep one row per product, the last one queued.
+
+        A product is reached twice in a run: once from the listing, again with
+        its detail. Postgres refuses an upsert that touches the same key twice
+        in a single statement - "ON CONFLICT DO UPDATE command cannot affect
+        row a second time" - and rejects the whole batch, not just the
+        duplicate. Keeping the last occurrence both avoids that and is the row
+        wanted anyway, because the detail is the richer of the two.
+        """
+        latest: dict[tuple[str, str], Product] = {}
+        for product in products:
+            latest[(product.site.casefold(), product.product_id)] = product
+        return list(latest.values())
+
     def _rows(self, products: Sequence[Product]) -> tuple[list[dict], list[dict]]:
         observed = _now()
         rows: list[dict[str, Any]] = []
         history: list[dict[str, Any]] = []
-        for product in products:
+        for product in self._latest_per_product(products):
             row = product.to_dict()
             row["scraped_at"] = product.scraped_at or observed
             row["last_checked_at"] = observed
@@ -109,8 +124,11 @@ class DatabaseSink:
             row["is_active"] = True
             if self.run_id:
                 row["last_seen_run_id"] = self.run_id
-            if product.product_id not in self._seen:
-                row["first_seen_at"] = row["scraped_at"]
+            # first_seen_at is deliberately absent. PostgREST rejects a bulk
+            # upsert whose objects do not all carry the same keys, so setting
+            # it on new products only made every mixed batch fail with
+            # PGRST102. The column defaults to now() on insert and is left
+            # untouched on update, which is the behaviour that was wanted.
             rows.append(row)
             history.append(
                 {
@@ -126,7 +144,6 @@ class DatabaseSink:
                     "scraped_at": row["scraped_at"],
                 }
             )
-            self._seen.add(product.product_id)
         return rows, history
 
     def _flush(self, products: Sequence[Product]) -> None:
@@ -153,6 +170,33 @@ class DatabaseSink:
                 exc,
             )
 
+    def _finish_run(self, *, complete_sweep: bool) -> None:
+        """Close the run record this sink opened.
+
+        Without this every run stays marked ``running`` for ever, which makes
+        the run history useless and makes a health check report healthy runs as
+        stuck - the watchdog cannot tell an abandoned run from one nobody
+        closed.
+        """
+        if not self.run_id:
+            return
+        status = (
+            "success"
+            if complete_sweep and not self.result.failures
+            else "partial"
+        )
+        try:
+            self.store.finish_run(
+                self.run_id,
+                status=status,
+                products_seen=self.result.products_written,
+                message=self.result.summary(),
+            )
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must not fail a run
+            self.logger.warning(
+                "db_sink_finish_failed site=%s error=%s", self.site, exc
+            )
+
     def close(self, *, complete_sweep: bool = False, inactive_threshold: int = 3) -> SinkResult:
         """Flush the tail and, after a complete sweep, age missing products.
 
@@ -162,6 +206,7 @@ class DatabaseSink:
         ones just because the run ended early.
         """
         self.flush()
+        self._finish_run(complete_sweep=complete_sweep)
         if complete_sweep and self.run_id and not self.result.failures:
             try:
                 self.store.finalize_missing(

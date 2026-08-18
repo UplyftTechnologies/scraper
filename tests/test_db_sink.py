@@ -74,6 +74,37 @@ class DatabaseSinkTests(unittest.TestCase):
             {"P0", "P1", "P2", "P3"},
         )
 
+    def test_every_row_in_a_batch_carries_identical_keys(self):
+        """PostgREST rejects a bulk upsert whose objects differ in shape.
+
+        Setting a key on only some rows - first_seen_at on products not seen
+        before - failed every mixed batch with PGRST102 "All object keys must
+        match", which silently lost the whole batch.
+        """
+        store = FakeStore()
+        sink = DatabaseSink(store=store, site="tira", batch_size=100)
+
+        sink.add(products(3))
+        sink.add(products(3))  # the same three again, now "already seen"
+        sink.add(products(2, start=90))  # plus two genuinely new ones
+        sink.close()
+
+        self.assertGreater(len(store.rows), 0)
+        shapes = {frozenset(row) for row in store.rows}
+        self.assertEqual(len(shapes), 1, f"rows differ in keys: {shapes}")
+        history_shapes = {frozenset(row) for row in store.history}
+        self.assertEqual(len(history_shapes), 1)
+
+    def test_first_seen_at_is_left_to_the_database(self):
+        """The column defaults on insert and must not be overwritten later."""
+        store = FakeStore()
+        sink = DatabaseSink(store=store, site="tira", batch_size=100)
+        sink.add(products(2))
+        sink.close()
+
+        for row in store.rows:
+            self.assertNotIn("first_seen_at", row)
+
     def test_rows_carry_the_run_id_so_missing_products_can_be_aged(self):
         store = FakeStore()
         sink = DatabaseSink(store=store, site="tira", run_id="run-1", batch_size=2)
@@ -83,7 +114,6 @@ class DatabaseSinkTests(unittest.TestCase):
         self.assertEqual(store.rows[0]["last_seen_run_id"], "run-1")
         self.assertTrue(store.rows[0]["is_active"])
         self.assertEqual(store.rows[0]["missing_run_count"], 0)
-        self.assertTrue(store.rows[0]["first_seen_at"])
 
     def test_a_failed_batch_never_ends_the_run(self):
         """The checkpoint still holds the data, so a lost batch is recoverable."""
@@ -136,8 +166,13 @@ class DatabaseSinkTests(unittest.TestCase):
         sink.close()
         self.assertEqual(store.rows, [])
 
-    def test_a_product_seen_twice_is_sent_twice_so_detail_wins(self):
-        """The listing row goes up first; the richer detail row replaces it."""
+    def test_a_product_queued_twice_is_sent_once_with_the_richer_row(self):
+        """Postgres rejects an upsert touching the same key twice per statement.
+
+        "ON CONFLICT DO UPDATE command cannot affect row a second time" kills
+        the whole batch, not just the duplicate. The listing row and its detail
+        must collapse to one row, and it has to be the detail.
+        """
         store = FakeStore()
         sink = DatabaseSink(store=store, site="tira", batch_size=100)
         listing = Product(site="tira", product_id="P1", brand="B", product_name="N")
@@ -152,8 +187,35 @@ class DatabaseSinkTests(unittest.TestCase):
         sink.add([detail])
         sink.close()
 
+        self.assertEqual(len(store.rows), 1)
+        self.assertEqual(store.rows[0]["description"], "the full text")
+
+    def test_a_batch_never_contains_the_same_key_twice(self):
+        store = FakeStore()
+        sink = DatabaseSink(store=store, site="tira", batch_size=100)
+        sink.add(products(5))
+        sink.add(products(5))  # every one a repeat
+        sink.close()
+
+        keys = [(row["site"], row["product_id"]) for row in store.rows]
+        self.assertEqual(len(keys), len(set(keys)), f"duplicate keys: {keys}")
+        history_keys = [
+            (row["site"], row["product_id"], row["scraped_at"])
+            for row in store.history
+        ]
+        self.assertEqual(len(history_keys), len(set(history_keys)))
+
+    def test_the_same_product_on_two_sites_is_not_collapsed(self):
+        store = FakeStore()
+        sink = DatabaseSink(store=store, site="tira", batch_size=100)
+        sink.add(
+            [
+                Product(site="tira", product_id="X", brand="B", product_name="N"),
+                Product(site="nykaa", product_id="X", brand="B", product_name="N"),
+            ]
+        )
+        sink.close()
         self.assertEqual(len(store.rows), 2)
-        self.assertEqual(store.rows[-1]["description"], "the full text")
 
 
 if __name__ == "__main__":

@@ -211,5 +211,82 @@ class HostedExportTests(unittest.TestCase):
             self.assertEqual([p.name for p in root.glob(".*tmp*")], [])
 
 
+
+class ExportScalingTests(unittest.TestCase):
+    """Writing a sheet must not get quadratically slower as it grows."""
+
+    def products(self, count):
+        return [
+            Product(
+                site="nykaa",
+                product_id=f"P{index}",
+                brand="Brand",
+                product_name=f"Product {index}",
+                mrp=1000.0,
+                selling_price=750.0,
+                discount_pct=25.0,
+                image_urls=[f"https://img.test/{index}-{n}.jpg" for n in range(8)],
+            )
+            for index in range(count)
+        ]
+
+    def test_the_sheet_is_never_asked_for_its_max_row(self):
+        """openpyxl rebuilds a set over every cell each time max_row is read.
+
+        Reading it once per row - or, as the images sheet did, once per image
+        URL - made the export quadratic and took the better part of an hour on
+        a real catalogue. Counting the accesses is deterministic, where timing
+        the export is not: a loaded machine can make a linear export look slow.
+        """
+        from openpyxl.worksheet.worksheet import Worksheet
+
+        reads = []
+        original = Worksheet.max_row.fget
+
+        def counting_max_row(self):
+            reads.append(1)
+            return original(self)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(
+                Worksheet, "max_row", property(counting_max_row)
+            ):
+                export_products(
+                    self.products(150), root / "s.xlsx", root / "s.csv"
+                )
+
+        # A handful for sheet dimensions is fine; per-row or per-image is not.
+        self.assertLess(
+            len(reads),
+            50,
+            f"max_row was read {len(reads)} times for 150 products",
+        )
+
+    def test_the_workbook_still_has_every_sheet_and_format(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = export_products(
+                self.products(30), root / "s.xlsx", root / "s.csv"
+            )
+            workbook = load_workbook(result.excel_path)
+            try:
+                self.assertEqual(
+                    workbook.sheetnames, ["combined", "nykaa", "images", "reviews"]
+                )
+                sheet = workbook["combined"]
+                self.assertEqual(sheet.freeze_panes, "A2")
+                mrp = OUTPUT_COLUMNS.index("mrp") + 1
+                self.assertEqual(sheet.cell(2, mrp).number_format, "₹#,##0.00")
+                self.assertEqual(sheet.max_row, 31)
+                # Columns are still sized from the data, not left at default.
+                self.assertGreater(
+                    sheet.column_dimensions["A"].width, 0
+                )
+                self.assertEqual(workbook["images"].max_row, 30 * 8 + 1)
+            finally:
+                workbook.close()
+
+
 if __name__ == "__main__":
     unittest.main()
