@@ -261,3 +261,85 @@ class DatabaseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MixedShapeUpsertTests(unittest.TestCase):
+    """PostgREST rejects a bulk upsert whose objects differ in their keys."""
+
+    def store_with(self, session) -> SupabaseCatalogStore:
+        return SupabaseCatalogStore(
+            url="https://project.supabase.co",
+            service_role_key="secret",
+            session=session,
+            sleeper=lambda _s: None,
+        )
+
+    def test_rows_of_different_shapes_go_in_separate_requests(self):
+        """first_seen_at belongs only on an insert, last_detail only on a refresh.
+
+        Sent together they fail with PGRST102 "All object keys must match",
+        and PostgREST rejects the whole request rather than the odd row.
+        """
+        session = Mock()
+        session.post.return_value = Mock(status_code=201, text="")
+        store = self.store_with(session)
+
+        written = store._upsert(
+            "retailer_products",
+            [
+                {"site": "tira", "product_id": "A", "first_seen_at": "t"},
+                {"site": "tira", "product_id": "B"},
+                {"site": "tira", "product_id": "C", "first_seen_at": "t"},
+                {"site": "tira", "product_id": "D", "last_detail_scraped_at": "t"},
+            ],
+            "site,product_id",
+        )
+
+        self.assertEqual(written, 4)
+        self.assertEqual(session.post.call_count, 3)
+        for call in session.post.call_args_list:
+            shapes = {frozenset(row) for row in call.kwargs["json"]}
+            self.assertEqual(len(shapes), 1, f"mixed shapes in one request: {shapes}")
+
+    def test_a_missing_key_is_never_padded_with_null(self):
+        """On an upsert a null overwrites the stored value.
+
+        Padding the gaps would blank first_seen_at on every product that was
+        not being inserted.
+        """
+        session = Mock()
+        session.post.return_value = Mock(status_code=201, text="")
+        store = self.store_with(session)
+
+        store._upsert(
+            "retailer_products",
+            [
+                {"site": "tira", "product_id": "A", "first_seen_at": "t"},
+                {"site": "tira", "product_id": "B"},
+            ],
+            "site,product_id",
+        )
+
+        sent = [row for call in session.post.call_args_list for row in call.kwargs["json"]]
+        plain = next(row for row in sent if row["product_id"] == "B")
+        self.assertNotIn("first_seen_at", plain)
+
+    def test_one_shape_still_batches_by_size(self):
+        session = Mock()
+        session.post.return_value = Mock(status_code=201, text="")
+        store = SupabaseCatalogStore(
+            url="https://project.supabase.co",
+            service_role_key="secret",
+            batch_size=10,
+            session=session,
+            sleeper=lambda _s: None,
+        )
+
+        written = store._upsert(
+            "retailer_products",
+            [{"site": "tira", "product_id": str(i)} for i in range(25)],
+            "site,product_id",
+        )
+
+        self.assertEqual(written, 25)
+        self.assertEqual(session.post.call_count, 3)

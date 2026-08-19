@@ -215,6 +215,28 @@ class SupabaseCatalogStore:
             f"Supabase request to {url} failed: {last_error}"
         )
 
+    @staticmethod
+    def _by_shape(
+        rows: list[Mapping[str, Any]]
+    ) -> list[list[Mapping[str, Any]]]:
+        """Group rows so every request carries objects of one shape.
+
+        PostgREST rejects a bulk upsert whose objects differ in their keys -
+        PGRST102, "All object keys must match" - and it rejects the whole
+        request, not the odd row out. Callers legitimately vary the keys: a
+        column like first_seen_at belongs only on a product being inserted, and
+        last_detail_scraped_at only on one whose detail was re-read.
+
+        Padding the gaps with null would be wrong, because on an upsert a null
+        overwrites the stored value. Splitting by shape keeps each row's
+        meaning exactly as the caller intended: a key that is absent stays
+        absent, and the column keeps whatever the database already holds.
+        """
+        groups: dict[frozenset[str], list[Mapping[str, Any]]] = {}
+        for row in rows:
+            groups.setdefault(frozenset(row), []).append(row)
+        return list(groups.values())
+
     def _upsert(
         self,
         table: str,
@@ -223,8 +245,12 @@ class SupabaseCatalogStore:
     ) -> int:
         written = 0
         endpoint = f"{self.url}/rest/v1/{table}"
-        for start in range(0, len(rows), self.batch_size):
-            batch = rows[start : start + self.batch_size]
+        batches = [
+            group[start : start + self.batch_size]
+            for group in self._by_shape(rows)
+            for start in range(0, len(group), self.batch_size)
+        ]
+        for batch in batches:
             response = self._send(
                 "POST",
                 endpoint,
