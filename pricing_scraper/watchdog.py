@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from pricing_scraper.nightly import HOSTED_SITES
 from pricing_scraper.config import (
     apply_environment_overrides,
     default_config_path,
@@ -178,7 +179,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Report whether the nightly scraping is healthy."
     )
-    parser.add_argument("--sites", default="nykaa,tira")
+    # Matches nightly.HOSTED_SITES: a site the night refreshes but the
+    # watchdog does not look at can go stale unnoticed.
+    parser.add_argument("--sites", default=",".join(HOSTED_SITES))
     parser.add_argument("--stuck-after-hours", type=int, default=STUCK_AFTER_HOURS)
     parser.add_argument("--max-age-hours", type=int, default=MAX_DATA_AGE_HOURS)
     parser.add_argument("--config", type=Path, default=None)

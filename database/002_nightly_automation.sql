@@ -3,7 +3,7 @@
 
 create table if not exists public.retailer_scrape_runs (
     id uuid primary key default gen_random_uuid(),
-    site text not null check (site in ('nykaa', 'tira')),
+    site text not null check (site in ('nykaa', 'tira', 'amazon', 'purplle', 'kindlife', 'broadway')),
     status text not null default 'running'
         check (status in ('running', 'success', 'partial', 'failed')),
     started_at timestamptz not null default now(),

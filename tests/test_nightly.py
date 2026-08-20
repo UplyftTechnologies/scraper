@@ -1,7 +1,10 @@
+import logging
+import os
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, Mock, patch
 
-from pricing_scraper import watchdog
+from pricing_scraper import nightly, watchdog
 from pricing_scraper.nightly import NightlyReport, StepResult
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
@@ -115,3 +118,141 @@ class WatchdogTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+def quiet_logger() -> logging.Logger:
+    """A logger that writes nowhere, so a failing leg does not spam the run."""
+    logger = logging.getLogger("nightly-test")
+    logger.handlers = [logging.NullHandler()]
+    logger.propagate = False
+    return logger
+
+
+class RevisionReportingTests(unittest.TestCase):
+    """A hosted run must say which build it is, not leave it to be inferred.
+
+    A run triggered while a build is still in flight uses the previous image,
+    so a fix that is already pushed can appear to have failed. Working that
+    out from line numbers in a traceback is slow; the log should just say it.
+    """
+
+    def test_the_render_commit_is_reported_short_with_its_branch(self):
+        with patch.dict(
+            os.environ,
+            {
+                "RENDER_GIT_COMMIT": "5e3139cf10a55180816f2ac2bafa4fb072dd05b1",
+                "RENDER_GIT_BRANCH": "main",
+            },
+            clear=False,
+        ):
+            self.assertEqual(nightly._running_revision(), "5e3139c on main")
+
+    def test_a_commit_without_a_branch_still_reports(self):
+        with patch.dict(
+            os.environ,
+            {"RENDER_GIT_COMMIT": "abcdef1234567890"},
+            clear=False,
+        ):
+            with patch.dict(os.environ, {"RENDER_GIT_BRANCH": ""}, clear=False):
+                self.assertEqual(nightly._running_revision(), "abcdef1")
+
+    def test_an_unlabelled_build_says_so_rather_than_guessing(self):
+        environment = {
+            key: ""
+            for key in ("RENDER_GIT_COMMIT", "GIT_COMMIT", "RENDER_GIT_BRANCH")
+        }
+        with patch.dict(os.environ, environment, clear=False):
+            self.assertIn("unknown", nightly._running_revision())
+
+
+class StorefrontLegTests(unittest.TestCase):
+    """The storefronts run in the night without the incremental machinery.
+
+    They discover their own catalogue and hand back finished products, so the
+    nightly streams them into the database and closes the run, rather than
+    calling run_incremental_site - which accepts only nykaa and tira.
+    """
+
+    def _config(self):
+        return {
+            "request": {
+                "timeout_seconds": 5,
+                "delay_min_seconds": 0,
+                "delay_max_seconds": 0,
+                "logs_dir": "logs",
+            },
+            "brands": ["Innisfree"],
+            "broadway": {},
+        }
+
+    def test_a_storefront_is_collected_and_streamed(self):
+        from pricing_scraper.models import Product
+
+        collected = [
+            Product(
+                site="broadway",
+                product_id="1",
+                brand="Innisfree",
+                product_name="Green Tea",
+                gtin="8800294993574",
+            )
+        ]
+        store = Mock()
+        store.start_run.return_value = "run-1"
+        store._upsert.return_value = 1
+
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.collect.side_effect = lambda on_product=None, **_k: (
+            [on_product(item) for item in collected] and collected
+        )
+        with patch(
+            "pricing_scraper.clients.broadway.BroadwayClient", return_value=client
+        ):
+            step = nightly._run_storefront(
+                "broadway", self._config(), store, quiet_logger()
+            )
+
+        self.assertTrue(step.ok)
+        self.assertIn("1 collected", step.detail)
+        self.assertIn("with a barcode", step.detail)
+        store.start_run.assert_called_once()
+
+    def test_a_storefront_failure_does_not_raise(self):
+        """One retailer must never stop the night."""
+        store = Mock()
+        store.start_run.return_value = "run-2"
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.collect.side_effect = RuntimeError("sitemap unreachable")
+        with patch(
+            "pricing_scraper.clients.broadway.BroadwayClient", return_value=client
+        ):
+            step = nightly._run_storefront(
+                "broadway", self._config(), store, quiet_logger()
+            )
+
+        self.assertFalse(step.ok)
+        self.assertIn("RuntimeError", step.detail)
+
+    def test_run_site_routes_storefronts_away_from_the_incremental_path(self):
+        with patch.object(nightly, "_run_storefront") as storefront:
+            with patch.object(nightly, "run_incremental_site") as incremental:
+                for site in nightly.STOREFRONT_SITES:
+                    nightly._run_site(site, {}, Mock(), quiet_logger())
+                incremental.assert_not_called()
+        self.assertEqual(storefront.call_count, len(nightly.STOREFRONT_SITES))
+
+
+class WatchdogCoverageTests(unittest.TestCase):
+    def test_the_watchdog_watches_every_site_the_night_refreshes(self):
+        """A site refreshed but unwatched can go stale without anyone noticing."""
+        from pricing_scraper import watchdog as watchdog_module
+
+        parser_default = watchdog_module.HOSTED_SITES
+        self.assertEqual(tuple(parser_default), tuple(nightly.HOSTED_SITES))
+
+    def test_amazon_stays_out_of_the_hosted_night(self):
+        """The hosted image installs no browser."""
+        self.assertNotIn("amazon", nightly.HOSTED_SITES)

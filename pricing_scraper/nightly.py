@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,8 +37,14 @@ from pricing_scraper.database import (
 )
 
 # Amazon is deliberately absent. The hosted image installs no browser, so an
-# Amazon leg here would fail every night; it is run locally instead.
-HOSTED_SITES = ("nykaa", "tira")
+# Amazon leg here would fail every night; it is run locally instead. The three
+# storefronts need no browser, so they do run here.
+HOSTED_SITES = ("nykaa", "tira", "purplle", "kindlife", "broadway")
+
+# Storefronts discover their own catalogue in a request or two and hand back
+# finished products, so they do not go through the incremental machinery the
+# older retailers need.
+STOREFRONT_SITES = ("purplle", "kindlife", "broadway")
 
 
 @dataclass(slots=True)
@@ -81,7 +88,62 @@ class NightlyReport:
         return "\n".join(lines)
 
 
+def _run_storefront(site, config, store, logger) -> StepResult:
+    """Collect one storefront straight into the database.
+
+    Nothing is exported here. The nightly job writes to Supabase, and the
+    hosted container has no durable disk for a workbook to live on, so the
+    products stream into the sink as they are read and the run record is
+    closed at the end.
+    """
+    import importlib
+
+    from pricing_scraper.dashboard_service import STOREFRONT_CLIENTS
+    from pricing_scraper.db_sink import DatabaseSink
+
+    started = time.monotonic()
+    run_id = ""
+    try:
+        run_id = store.start_run(site, metadata={"mode": "nightly"})
+    except Exception as exc:  # noqa: BLE001 - bookkeeping must not stop the night
+        logger.warning("nightly_run_record_failed site=%s error=%s", site, exc)
+
+    sink = DatabaseSink(store=store, site=site, run_id=run_id, logger=logger)
+    module = importlib.import_module(f"pricing_scraper.clients.{site}")
+    client_class = getattr(module, STOREFRONT_CLIENTS[site])
+    try:
+        client = client_class(
+            config.get(site) or {},
+            config["request"],
+            brands=config.get("brands") or [],
+            logger=logger,
+        )
+        with client:
+            products = client.collect(on_product=lambda item: sink.add([item]))
+    except Exception as exc:  # noqa: BLE001 - one storefront must not stop the night
+        logger.exception("nightly_site_failed site=%s", site)
+        sink.close(complete_sweep=False)
+        return StepResult(
+            site,
+            False,
+            time.monotonic() - started,
+            f"{type(exc).__name__}: {exc}"[:160],
+        )
+
+    result = sink.close(complete_sweep=True)
+    with_gtin = sum(1 for item in products if item.gtin)
+    return StepResult(
+        site,
+        not result.failures,
+        time.monotonic() - started,
+        f"{len(products):,} collected, {with_gtin:,} with a barcode, "
+        f"{result.products_written:,} written, {result.failures:,} failed batches",
+    )
+
+
 def _run_site(site, config, store, logger) -> StepResult:
+    if site in STOREFRONT_SITES:
+        return _run_storefront(site, config, store, logger)
     started = time.monotonic()
     try:
         summary = run_incremental_site(
@@ -145,10 +207,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _running_revision() -> str:
+    """Describe the build this process is actually running.
+
+    A hosted job runs whatever image was last built, which is not necessarily
+    the newest commit: a run triggered while a build is still in flight uses
+    the previous one. That has already cost a full nightly sweep, where a
+    fixed bug appeared to reoccur simply because the fix was not deployed
+    yet. Stating the revision in the log makes that visible immediately
+    instead of having to infer it from line numbers in a traceback.
+    """
+    commit = (
+        os.environ.get("RENDER_GIT_COMMIT")
+        or os.environ.get("GIT_COMMIT")
+        or ""
+    ).strip()
+    branch = os.environ.get("RENDER_GIT_BRANCH", "").strip()
+    if not commit:
+        return "unknown (no RENDER_GIT_COMMIT in the environment)"
+    return f"{commit[:7]}{f' on {branch}' if branch else ''}"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logger = build_logger("nightly", Path("logs") / "nightly")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    revision = _running_revision()
+    logger.info("nightly_revision commit=%s", revision)
+    print(f"running revision: {revision}")
 
     report = NightlyReport()
     try:

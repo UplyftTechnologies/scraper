@@ -34,12 +34,14 @@ services:
       - key: TIRA_APPLICATION_TOKEN
         sync: false
 
-  # Midnight IST is 18:30 UTC. One job, in order: every retailer refreshed,
-  # then barcodes propagated between them. The order matters - propagating
+  # Midnight IST is 18:30 UTC. One job, in order: every retailer refreshed -
+  # Nykaa, Tira, then the Purplle, Kindlife and Broadway storefronts - and
+  # then barcodes propagated between them. The order matters: propagating
   # before the refresh would spread yesterday's catalogue.
   #
   # Amazon is absent on purpose: the image installs no browser, so an Amazon
-  # leg would fail every night. Run it locally instead.
+  # leg would fail every night. Run it locally instead. The storefronts need
+  # no browser, so they belong here.
   - type: cron
     name: beauty-nightly
     runtime: docker
