@@ -7,7 +7,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from pricing_scraper.clients.base import RequestFailed
 from pricing_scraper.clients.nykaa import NykaaClient
@@ -256,6 +256,7 @@ def _enrich_nykaa(
     *,
     limit: int,
     logger: logging.Logger,
+    progress: Callable[[str, int, int, str], None] | None = None,
 ) -> tuple[list[Product], set[str], set[str], int]:
     enriched: list[Product] = []
     refreshed_ids: set[str] = set()
@@ -267,7 +268,10 @@ def _enrich_nykaa(
         parent = product.parent_product_id or product.product_id
         parents.setdefault(parent, product)
         parent_members.setdefault(parent, set()).add(product.product_id)
-    for parent, product in list(parents.items())[:limit]:
+    queue = list(parents.items())[:limit]
+    for index, (parent, product) in enumerate(queue, start=1):
+        if progress is not None:
+            progress("details", index, len(queue), "")
         try:
             details = client.fetch_product_details(product)
         except RequestFailed as exc:
@@ -298,11 +302,15 @@ def _enrich_tira(
     *,
     limit: int,
     logger: logging.Logger,
+    progress: Callable[[str, int, int, str], None] | None = None,
 ) -> tuple[list[Product], set[str], set[str], int]:
     enriched: list[Product] = []
     refreshed_ids: set[str] = set()
     failures = 0
-    for product in candidates[:limit]:
+    queue = candidates[:limit]
+    for index, product in enumerate(queue, start=1):
+        if progress is not None:
+            progress("details", index, len(queue), "")
         try:
             detail = client.fetch_variant_price(product)
         except Exception:
@@ -323,6 +331,7 @@ def run_incremental_site(
     config: Mapping[str, Any],
     store: SupabaseCatalogStore,
     logger: logging.Logger,
+    progress: Callable[[str, int, int, str], None] | None = None,
 ) -> NightlySummary:
     """Collect one retailer and persist only new or changed product states."""
     if site not in {"nykaa", "tira"}:
@@ -359,7 +368,11 @@ def run_incremental_site(
             request_config=config["request"],
             brands=config.get("brands", ()),
         ) as client:
+            if progress is not None:
+                progress("listing", 0, 0, "reading the catalogue")
             listing, complete, stop_reasons = _collect_listing(client)
+            if progress is not None:
+                progress("listing", len(listing), len(listing), "collected")
             if client.brand_filter:
                 # A brand-filtered sweep never sees the rest of the catalogue,
                 # so it must not age other brands out of the database.
@@ -397,20 +410,14 @@ def run_incremental_site(
                 product.product_id: source_fingerprint(product)
                 for product in listing
             }
-            if site == "nykaa":
-                details, refreshed_ids, unavailable_ids, detail_failures = _enrich_nykaa(
-                    client,
-                    candidates,
-                    limit=detail_limit,
-                    logger=logger,
-                )
-            else:
-                details, refreshed_ids, unavailable_ids, detail_failures = _enrich_tira(
-                    client,
-                    candidates,
-                    limit=detail_limit,
-                    logger=logger,
-                )
+            enrich = _enrich_nykaa if site == "nykaa" else _enrich_tira
+            details, refreshed_ids, unavailable_ids, detail_failures = enrich(
+                client,
+                candidates,
+                limit=detail_limit,
+                logger=logger,
+                progress=progress,
+            )
             detail_by_id = {product.product_id: product for product in details}
             final_products = [detail_by_id.get(item.product_id, item) for item in listing]
             listing_ids = {product.product_id for product in listing}

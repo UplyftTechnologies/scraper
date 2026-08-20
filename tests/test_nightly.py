@@ -256,3 +256,71 @@ class WatchdogCoverageTests(unittest.TestCase):
     def test_amazon_stays_out_of_the_hosted_night(self):
         """The hosted image installs no browser."""
         self.assertNotIn("amazon", nightly.HOSTED_SITES)
+
+
+class StepProgressTests(unittest.TestCase):
+    """A hosted job has no terminal, so progress is an occasional line."""
+
+    def lines(self, calls, *, interval=30.0):
+        printed = []
+        report = nightly.StepProgress("nykaa", interval_seconds=interval)
+        with patch("builtins.print", lambda *a, **k: printed.append(a[0])):
+            for call in calls:
+                report(*call)
+        return printed
+
+    def test_a_total_gives_a_percentage_and_an_estimate(self):
+        [line] = self.lines([("details", 250, 1000, "")])
+        self.assertIn("250/1,000", line)
+        self.assertIn("(25%)", line)
+        self.assertIn("left", line)
+
+    def test_progress_without_a_total_still_reports_the_count(self):
+        [line] = self.lines([("products", 42, 0, "")])
+        self.assertIn("42", line)
+        self.assertNotIn("%", line)
+
+    def test_lines_are_rate_limited_so_the_log_stays_readable(self):
+        """One line per product would be the flood this replaces."""
+        calls = [("details", n, 5000, "") for n in range(1, 400)]
+        printed = self.lines(calls, interval=30.0)
+        self.assertEqual(len(printed), 1, f"expected one line, got {len(printed)}")
+
+    def test_a_new_stage_always_prints(self):
+        printed = self.lines(
+            [("listing", 1, 0, ""), ("details", 1, 0, "")], interval=999
+        )
+        self.assertEqual(len(printed), 2)
+
+    def test_the_final_update_always_prints(self):
+        printed = self.lines(
+            [("details", 1, 10, ""), ("details", 10, 10, "")], interval=999
+        )
+        self.assertEqual(len(printed), 2)
+        self.assertIn("(100%)", printed[-1])
+
+    def test_the_site_is_named_so_legs_can_be_told_apart(self):
+        [line] = self.lines([("listing", 5, 0, "")])
+        self.assertIn("[nykaa]", line)
+
+
+class ProgressWiringTests(unittest.TestCase):
+    def test_the_incremental_leg_is_given_a_reporter(self):
+        store = Mock()
+        with patch.object(nightly, "run_incremental_site") as incremental:
+            incremental.return_value = Mock(
+                status="success", products_seen=1, products_new=0, products_changed=0
+            )
+            nightly._run_site("nykaa", {}, store, quiet_logger())
+        reporter = incremental.call_args.kwargs.get("progress")
+        self.assertIsInstance(reporter, nightly.StepProgress)
+
+    def test_the_enrichers_accept_a_reporter(self):
+        """Progress has to reach the detail loop; that is where the time goes."""
+        import inspect
+
+        from pricing_scraper import automation
+
+        for name in ("_enrich_nykaa", "_enrich_tira"):
+            signature = inspect.signature(getattr(automation, name))
+            self.assertIn("progress", signature.parameters, name)

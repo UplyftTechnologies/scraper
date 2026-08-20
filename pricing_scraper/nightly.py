@@ -25,7 +25,11 @@ from pathlib import Path
 from typing import Sequence
 
 from pricing_scraper.automation import run_incremental_site
-from pricing_scraper.clients.base import ConfigurationError, build_logger
+from pricing_scraper.clients.base import (
+    ConfigurationError,
+    build_logger,
+    set_console_log_level,
+)
 from pricing_scraper.config import (
     apply_environment_overrides,
     default_config_path,
@@ -45,6 +49,61 @@ HOSTED_SITES = ("nykaa", "tira", "purplle", "kindlife", "broadway")
 # finished products, so they do not go through the incremental machinery the
 # older retailers need.
 STOREFRONT_SITES = ("purplle", "kindlife", "broadway")
+
+
+class StepProgress:
+    """Report how far a leg of the night has got, into a log stream.
+
+    A hosted job has no terminal to redraw, so this is not a bar: it prints a
+    line at a fixed interval and nothing in between. The per-request logging
+    the clients emit is far too fine-grained to follow - thousands of lines
+    that never say how many are left - and it is quietened while the night
+    runs so these lines are visible at all.
+    """
+
+    __slots__ = ("site", "interval", "_started", "_last", "_stage")
+
+    def __init__(self, site: str, *, interval_seconds: float = 30.0) -> None:
+        self.site = site
+        self.interval = max(1.0, float(interval_seconds))
+        self._started = time.monotonic()
+        self._last = 0.0
+        self._stage = ""
+
+    @staticmethod
+    def _clock(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        hours, rest = divmod(seconds, 3600)
+        minutes, secs = divmod(rest, 60)
+        if hours:
+            return f"{hours}h{minutes:02d}m"
+        if minutes:
+            return f"{minutes}m{secs:02d}s"
+        return f"{secs}s"
+
+    def __call__(
+        self, stage: str, done: int, total: int = 0, message: str = ""
+    ) -> None:
+        now = time.monotonic()
+        # A stage change always prints: it is the clearest sign the leg moved
+        # on, and suppressing it can leave the log silent for a long stretch.
+        changed = stage != self._stage
+        finished = bool(total) and done >= total
+        if not changed and not finished and now - self._last < self.interval:
+            return
+        self._stage = stage
+        self._last = now
+        elapsed = now - self._started
+        parts = [f"[{self.site}] {stage}", f"{done:,}"]
+        if total:
+            parts[-1] = f"{done:,}/{total:,} ({done / total:.0%})"
+            if done and not finished:
+                remaining = elapsed / done * (total - done)
+                parts.append(f"~{self._clock(remaining)} left")
+        parts.append(f"{self._clock(elapsed)} elapsed")
+        if message:
+            parts.append(message)
+        print("  " + " · ".join(parts), flush=True)
 
 
 @dataclass(slots=True)
@@ -109,6 +168,7 @@ def _run_storefront(site, config, store, logger) -> StepResult:
         logger.warning("nightly_run_record_failed site=%s error=%s", site, exc)
 
     sink = DatabaseSink(store=store, site=site, run_id=run_id, logger=logger)
+    report = StepProgress(site)
     module = importlib.import_module(f"pricing_scraper.clients.{site}")
     client_class = getattr(module, STOREFRONT_CLIENTS[site])
     try:
@@ -118,8 +178,16 @@ def _run_storefront(site, config, store, logger) -> StepResult:
             brands=config.get("brands") or [],
             logger=logger,
         )
+        seen = 0
+
+        def on_product(item) -> None:
+            nonlocal seen
+            seen += 1
+            sink.add([item])
+            report("products", seen, 0, "")
+
         with client:
-            products = client.collect(on_product=lambda item: sink.add([item]))
+            products = client.collect(on_product=on_product)
     except Exception as exc:  # noqa: BLE001 - one storefront must not stop the night
         logger.exception("nightly_site_failed site=%s", site)
         sink.close(complete_sweep=False)
@@ -147,7 +215,11 @@ def _run_site(site, config, store, logger) -> StepResult:
     started = time.monotonic()
     try:
         summary = run_incremental_site(
-            site=site, config=config, store=store, logger=logger
+            site=site,
+            config=config,
+            store=store,
+            logger=logger,
+            progress=StepProgress(site),
         )
     except Exception as exc:  # noqa: BLE001 - one retailer must not stop the night
         logger.exception("nightly_site_failed site=%s", site)
@@ -204,6 +276,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Refresh the retailers and stop before propagating barcodes.",
     )
     parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help=(
+            "Log every retailer request. Off by default: the per-request "
+            "lines bury the progress reports."
+        ),
+    )
     return parser
 
 
@@ -232,6 +312,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logger = build_logger("nightly", Path("logs") / "nightly")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    # The clients log a line per request. Over a full night that is tens of
+    # thousands of lines saying nothing about how far along the run is, and
+    # they hid the progress reports completely. The file logs still get them.
+    set_console_log_level(logging.INFO if args.verbose else logging.WARNING)
     revision = _running_revision()
     logger.info("nightly_revision commit=%s", revision)
     print(f"running revision: {revision}")
