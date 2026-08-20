@@ -44,6 +44,33 @@ def normalize_gtin(value: Any) -> str:
     return digits
 
 
+
+def plausible_retail_barcode(gtin: str) -> bool:
+    """Reject GS1 prefixes that are never a manufacturer's retail barcode.
+
+    A store's internal identifier can carry a valid check digit and still not
+    be a barcode. Purplle's ``master_product_id`` is the clearest case: values
+    like ``9991308610002`` validate perfectly but sit in a range GS1 reserves
+    for coupons and refund receipts, where a genuine EAN such as
+    ``8906118410545`` (890 = India) does not.
+
+    This matters beyond one field being wrong. The GTIN supervisor copies a
+    barcode from the retailer that has one to the retailers that do not, so an
+    internal code accepted here would be propagated across the catalogue.
+    """
+    if not gtin:
+        return False
+    prefix = int(gtin[-13:].zfill(13)[:3])
+    restricted = (
+        20 <= prefix <= 29        # restricted circulation within a company
+        or 40 <= prefix <= 49     # restricted circulation within a region
+        or 50 <= prefix <= 59     # coupons
+        or 200 <= prefix <= 299   # in-store / variable measure
+        or prefix >= 980          # refund receipts, coupons, ISSN/ISMN
+    )
+    return not restricted
+
+
 @dataclass(slots=True)
 class Product:
     """A normalized product/SKU observation from one retailer."""

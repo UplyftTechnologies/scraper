@@ -928,3 +928,179 @@ class AmazonBrandSearchTests(unittest.TestCase):
         client.brand_names = ["COSRX", "d'Alba Piedmont"]
         # The names must survive as written; the folded key cannot be searched.
         self.assertEqual(client.brand_names, ["COSRX", "d'Alba Piedmont"])
+
+
+class AmazonBrandFacetTests(unittest.TestCase):
+    """A plain keyword search for a brand returns mostly other brands.
+
+    Measured on Amazon's own results, a search for COSRX put 15% of its cards
+    on target; the rest were product pages that would be opened and then
+    thrown away by the brand filter. Asking Amazon to restrict the results to
+    the brand raised that to between 47% and 100% across the brands sampled.
+    """
+
+    def client(self, page_urls):
+        client = AmazonClient.__new__(AmazonClient)
+        client.brand_search_page_limit = 1
+        client.max_products_per_brand = 40
+        client.page_failures = 0
+        client.logger = quiet_logger("amazon-facet-test")
+        client.asked = []
+
+        def browse(url, _parser):
+            client.asked.append(url)
+            return page_urls.pop(0) if page_urls else []
+
+        client._browse = browse
+        return client
+
+    def test_the_search_is_restricted_to_the_brand(self):
+        client = self.client([["https://www.amazon.in/dp/B000000001"]])
+
+        urls = client.discover_brand_urls("COSRX")
+
+        self.assertEqual(urls, ["https://www.amazon.in/dp/B000000001"])
+        self.assertIn("p_89%3ACOSRX", client.asked[0])
+
+    def test_a_brand_the_facet_does_not_know_falls_back_to_keywords(self):
+        """Amazon honours the facet only on an exact catalogue spelling.
+
+        When it does not match, the search returns nothing rather than an
+        error, and accepting that zero would silently drop the brand from the
+        sweep entirely.
+        """
+        client = self.client([[], ["https://www.amazon.in/dp/B000000002"]])
+
+        urls = client.discover_brand_urls("Some Brand")
+
+        self.assertEqual(urls, ["https://www.amazon.in/dp/B000000002"])
+        self.assertEqual(len(client.asked), 2)
+        self.assertIn("rh=", client.asked[0])
+        self.assertNotIn("rh=", client.asked[1])
+
+    def test_a_brand_name_with_punctuation_is_escaped(self):
+        client = self.client([["https://www.amazon.in/dp/B000000003"]])
+
+        client.discover_brand_urls("d'Alba Piedmont")
+
+        self.assertNotIn(" ", client.asked[0])
+        self.assertIn("p_89", client.asked[0])
+
+
+class AmazonChallengeDetectionTests(unittest.TestCase):
+    """The challenge check reads a copy of the page already in hand."""
+
+    def test_a_captcha_page_is_recognised(self):
+        html = "<html><body>enter the characters you see below</body></html>"
+        self.assertTrue(AmazonClient._is_captcha(html))
+
+    def test_an_ordinary_product_page_is_not(self):
+        html = "<html><body><span id='productTitle'>A Face Cream</span></body></html>"
+        self.assertFalse(AmazonClient._is_captcha(html))
+
+    def test_the_interstitial_marker_is_recognised(self):
+        self.assertTrue(AmazonClient._is_captcha("<html>bm-verify</html>"))
+
+
+class AmazonBrandRecoveryTests(unittest.TestCase):
+    """An unreadable brand is not harmless: the sweep drops what it cannot name.
+
+    Amazon serves product pages in more than one layout. Pages without a
+    #bylineInfo element left brand empty, and because an empty brand never
+    matches the configured filter, genuine products of collected brands were
+    discarded - measured on real COSRX pages, which carry no byline at all.
+    """
+
+    def client(self, names):
+        client = AmazonClient.__new__(AmazonClient)
+        client.brand_names = names
+        return client
+
+    def test_a_brand_is_recovered_from_the_front_of_the_title(self):
+        client = self.client(["COSRX", "Minimalist"])
+        self.assertEqual(
+            client._brand_from_title("COSRX Retinol Cream, 0.67 Oz"), "COSRX"
+        )
+
+    def test_the_longest_configured_name_wins(self):
+        client = self.client(["The Face", "The Face Shop"])
+        self.assertEqual(
+            client._brand_from_title("The Face Shop 8 Peptide Moisturizer"),
+            "The Face Shop",
+        )
+
+    def test_punctuation_between_brand_and_product_does_not_matter(self):
+        client = self.client(["d'Alba Piedmont"])
+        self.assertEqual(
+            client._brand_from_title("dAlba Piedmont White Truffle Serum"),
+            "d'Alba Piedmont",
+        )
+
+    def test_a_brand_named_only_later_in_the_title_is_not_claimed(self):
+        """Titles open with their brand; a mention further along is a
+        comparison or a compatibility note, not the product's own brand."""
+        client = self.client(["COSRX"])
+        self.assertEqual(
+            client._brand_from_title("Snail Mucin Cream similar to COSRX"), ""
+        )
+
+    def test_an_unrecognised_brand_stays_empty(self):
+        client = self.client(["COSRX"])
+        self.assertEqual(client._brand_from_title("Himalaya Neem Face Wash"), "")
+
+    def test_an_empty_title_is_handled(self):
+        self.assertEqual(self.client(["COSRX"])._brand_from_title(""), "")
+
+
+class AmazonContentToggleTests(unittest.TestCase):
+    """Descriptive copy can be skipped; identity and pricing cannot.
+
+    Every one of those fields costs a locator call, and a locator call is a
+    round trip into the browser. The product attribute table stays regardless
+    of the setting, because the barcode and the pack size are read out of it.
+    """
+
+    def test_the_flag_defaults_to_collecting_content(self):
+        client = AmazonClient(
+            {"delay_min_seconds": 0, "delay_max_seconds": 0},
+            {"logs_dir": "logs"},
+            sleeper=lambda _s: None,
+            logger=quiet_logger("amazon-content-default"),
+        )
+        self.assertTrue(client.collect_content)
+
+    def test_the_flag_can_be_turned_off(self):
+        client = AmazonClient(
+            {
+                "collect_content": False,
+                "delay_min_seconds": 0,
+                "delay_max_seconds": 0,
+            },
+            {"logs_dir": "logs"},
+            sleeper=lambda _s: None,
+            logger=quiet_logger("amazon-content-off"),
+        )
+        self.assertFalse(client.collect_content)
+
+    def test_the_attribute_table_is_read_outside_the_content_branch(self):
+        """The barcode and the pack size come from the attribute table.
+
+        Were that read to drift inside the content branch, turning the copy
+        off would quietly stop collecting barcodes too. Indentation is what
+        distinguishes the two here: the branch body is one level deeper than
+        the method body.
+        """
+        import inspect
+
+        source = inspect.getsource(AmazonClient)
+        reads = [
+            line
+            for line in source.splitlines()
+            if "attributes = self._attributes(page)" in line
+        ]
+        self.assertTrue(reads, "the attribute table is no longer read")
+        for line in reads:
+            indent = len(line) - len(line.lstrip())
+            self.assertEqual(
+                indent, 8, f"attribute read is nested inside a branch: {line!r}"
+            )

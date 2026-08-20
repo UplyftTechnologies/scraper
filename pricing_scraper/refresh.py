@@ -73,6 +73,39 @@ STALE = "stale"
 FRESH = "fresh"
 
 
+
+# Fields that exist only when a site collects descriptive copy.
+_CONTENT_FIELDS = frozenset(
+    {
+        "description",
+        "description_html",
+        "key_features",
+        "ingredients",
+        "how_to_use",
+        "top_reviews",
+        "special_features",
+        "key_ingredients",
+    }
+)
+
+
+def _site_collects_content(config: Mapping[str, Any]) -> bool:
+    """Is any configured site still gathering descriptive copy?
+
+    Only Amazon can be told to skip it today. The check is written over the
+    whole config rather than one key so that a second site gaining the same
+    switch does not silently reintroduce the forever-incomplete problem.
+    """
+    switches = [
+        section.get("collect_content")
+        for section in config.values()
+        if isinstance(section, Mapping) and "collect_content" in section
+    ]
+    if not switches:
+        return True
+    return any(bool(value) for value in switches)
+
+
 @dataclass(frozen=True, slots=True)
 class RefreshPolicy:
     """When a stored product is considered worth requesting again."""
@@ -104,6 +137,14 @@ class RefreshPolicy:
             required = tuple(str(name).strip() for name in fields if str(name).strip())
         else:
             required = DEFAULT_REQUIRED_FIELDS
+        if not _site_collects_content(config):
+            # A field the scrape no longer collects can never be filled, so
+            # requiring it would mark every product incomplete and re-request
+            # the whole catalogue on every run - the exact opposite of what
+            # switching the copy off was meant to achieve.
+            required = tuple(
+                name for name in required if name not in _CONTENT_FIELDS
+            )
         return cls(
             enabled=(
                 bool(section.get("enabled", True)) if enabled is None else bool(enabled)

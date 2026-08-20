@@ -224,3 +224,34 @@ class KnownProductTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContentDisabledPolicyTests(unittest.TestCase):
+    """A field the scrape no longer gathers must stop being required.
+
+    Amazon can be told to skip descriptive copy. If description stayed in the
+    required list, every product would read as incomplete for ever and the
+    whole catalogue would be re-requested on every run - slower than before
+    the copy was switched off, not faster.
+    """
+
+    def test_content_fields_are_dropped_when_no_site_collects_them(self):
+        policy = RefreshPolicy.from_config({"amazon": {"collect_content": False}})
+        self.assertEqual(policy.required_fields, ("image_urls",))
+
+    def test_content_fields_are_kept_while_a_site_still_collects_them(self):
+        policy = RefreshPolicy.from_config({"amazon": {"collect_content": True}})
+        self.assertIn("description", policy.required_fields)
+
+    def test_a_config_without_the_switch_is_unchanged(self):
+        policy = RefreshPolicy.from_config({})
+        self.assertIn("description", policy.required_fields)
+
+    def test_an_explicit_required_list_is_also_filtered(self):
+        policy = RefreshPolicy.from_config(
+            {
+                "amazon": {"collect_content": False},
+                "refresh": {"required_fields": ["description", "gtin"]},
+            }
+        )
+        self.assertEqual(policy.required_fields, ("gtin",))

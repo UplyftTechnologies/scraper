@@ -12,14 +12,19 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence, TypeVar
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 from playwright.sync_api import Browser, BrowserContext, Page, Playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 
-from pricing_scraper.models import Product, brand_key, normalize_gtin
+from pricing_scraper.models import (
+    Product,
+    brand_key,
+    normalize_gtin,
+    plausible_retail_barcode,
+)
 
 from .base import ConfigurationError, build_logger
 
@@ -77,25 +82,6 @@ GTIN_FALLBACK_LABELS = (
 GTIN_FALLBACK_LENGTHS = frozenset({13, 14})
 
 
-def _plausible_retail_barcode(gtin: str) -> bool:
-    """Reject GS1 prefixes that are never a manufacturer's retail barcode.
-
-    A padded internal code such as ``992880990000`` can carry a valid check
-    digit, but its prefix falls in a range GS1 reserves for coupons or in-store
-    use, so it can be told apart from a genuine EAN like ``8904417306224``
-    (890 = India) without guessing.
-    """
-    prefix = int(gtin[-13:].zfill(13)[:3])
-    restricted = (
-        20 <= prefix <= 29        # restricted circulation within a company
-        or 40 <= prefix <= 49     # restricted circulation within a region
-        or 50 <= prefix <= 59     # coupons
-        or 200 <= prefix <= 299   # in-store / variable measure
-        or prefix >= 980          # refund receipts, coupons, ISSN/ISMN
-    )
-    return not restricted
-
-
 def _attribute_gtin(attributes: Mapping[str, Any]) -> str:
     """Read a barcode from the product-information table when Amazon lists one.
 
@@ -114,7 +100,7 @@ def _attribute_gtin(attributes: Mapping[str, Any]) -> str:
         if (
             gtin
             and len(gtin) in GTIN_FALLBACK_LENGTHS
-            and _plausible_retail_barcode(gtin)
+            and plausible_retail_barcode(gtin)
         ):
             return gtin
     return ""
@@ -257,6 +243,16 @@ class AmazonClient:
         self.search_result_timeout_ms = max(
             1_000, int(site_config.get("search_result_timeout_ms", 12_000))
         )
+        # Measured over 14 live product pages with the variants interleaved:
+        # 6.67s a page as it was, 5.17s fetching the document once, and 4.13s
+        # once the assets are blocked as well.
+        self.block_assets = bool(site_config.get("block_assets", True))
+        # Descriptive copy - the feature bullets, the product description, the
+        # important-information panel and the reviews - costs a locator call
+        # each, and every locator call is a round trip into the browser. The
+        # product attribute table is never skipped: the barcode and the pack
+        # size are read from it.
+        self.collect_content = bool(site_config.get("collect_content", True))
         self.challenge_wait_ms = max(
             0, int(site_config.get("challenge_wait_ms", 7_000))
         )
@@ -407,10 +403,31 @@ class AmazonClient:
             self.sleeper(delay)
         self._request_times.append(time.monotonic())
 
+    BLOCKED_RESOURCES = frozenset(
+        {"image", "media", "font", "stylesheet"}
+    )
+
+    def _block_asset(self, route: Any) -> None:
+        """Drop requests for bytes no parser ever reads.
+
+        Amazon product pages are mostly imagery. Aborting those requests does
+        not touch the markup - an <img> keeps its src, and the srcset Amazon
+        hides in data-a-dynamic-image is an attribute - so the image URLs the
+        catalogue collects survive while the bytes behind them are never
+        transferred.
+        """
+        try:
+            if route.request.resource_type in self.BLOCKED_RESOURCES:
+                route.abort()
+            else:
+                route.continue_()
+        except Exception:  # noqa: BLE001 - a closed page must not fail the run
+            pass
+
     def _new_context(self) -> BrowserContext:
         if self._browser is None:
             raise RuntimeError("AmazonClient must be used as a context manager.")
-        return self._browser.new_context(
+        context = self._browser.new_context(
             viewport={"width": 1440, "height": 1000},
             locale="en-IN",
             timezone_id="Asia/Kolkata",
@@ -420,6 +437,9 @@ class AmazonClient:
                 "Chrome/150.0.0.0 Safari/537.36"
             ),
         )
+        if self.block_assets:
+            context.route("**/*", self._block_asset)
+        return context
 
     def _active_context(self) -> BrowserContext:
         """Reuse cookies during a run; failed attempts get a fresh context."""
@@ -432,11 +452,19 @@ class AmazonClient:
         return page.title()
 
     @staticmethod
-    def _is_captcha(page: Page) -> bool:
-        body = _text(page.locator("body").inner_text(timeout=5_000)).casefold()
-        html = page.content().casefold()
+    def _is_captcha(folded_html: str) -> bool:
+        """Spot a challenge page from a copy of the document already fetched.
+
+        This used to read the page itself, once through the body inner_text
+        and again through content(). With the two other content() calls
+        _browse made, a single navigation serialized a multi-megabyte document
+        across the browser bridge four times to answer questions that one copy
+        answers. The body text is a subset of the markup, so matching the
+        markup alone loses nothing; were a marker ever split across tags the
+        parser simply fails on the challenge page and the attempt is retried.
+        """
         return any(
-            marker in body or marker in html
+            marker in folded_html
             for marker in (
                 "enter the characters you see",
                 "type the characters you see in this image",
@@ -467,12 +495,17 @@ class AmazonClient:
                     and url.rstrip("/") == "https://www.amazon.in"
                 ):
                     page.wait_for_timeout(self.warmup_wait_ms)
-                if (
-                    self.challenge_wait_ms
-                    and "bm-verify" in page.content().casefold()
-                ):
+                # One copy of the document answers everything below: the
+                # interstitial check, the CAPTCHA check and the logged size.
+                html = page.content()
+                folded = html.casefold()
+                if self.challenge_wait_ms and "bm-verify" in folded:
                     page.wait_for_timeout(self.challenge_wait_ms)
-                if self._is_captcha(page):
+                    # The wait exists to let the interstitial resolve into the
+                    # real page, so the copy taken before it is now stale.
+                    html = page.content()
+                    folded = html.casefold()
+                if self._is_captcha(folded):
                     self.blocks_encountered += 1
                     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                     page.screenshot(
@@ -483,7 +516,7 @@ class AmazonClient:
                 if status >= 400:
                     raise RuntimeError(f"Amazon returned HTTP {status}")
                 result = parser(page)
-                body_size = len(page.content().encode("utf-8"))
+                body_size = len(html.encode("utf-8"))
                 self.logger.info(
                     "amazon_page url=%s status=%s bytes=%s parse=success",
                     url,
@@ -857,21 +890,48 @@ class AmazonClient:
         brand name instead asks Amazon for that brand's own catalogue, which is
         the only way to reach the long tail of a large brand list.
         """
-        query = quote_plus(f"{_text(brand)}")
+        urls = self._brand_search(brand, faceted=True)
+        if not urls:
+            # Amazon only honours the facet when the value matches the brand
+            # exactly as its catalogue spells it. When it does not, the search
+            # returns nothing at all, and a silent zero would drop the brand
+            # from the sweep - so fall back to the plain keyword search.
+            self.logger.info(
+                "amazon_brand_facet_empty brand=%s falling_back=keyword", brand
+            )
+            urls = self._brand_search(brand, faceted=False)
+        return urls
+
+    def _brand_search(self, brand: str, *, faceted: bool) -> list[str]:
+        """Page through one brand's search results and collect product URLs.
+
+        The faceted form asks Amazon to restrict the results to the brand
+        itself rather than merely ranking for its name. A plain keyword search
+        for a brand returns mostly other brands' products - measured at 15% on
+        target for COSRX - and each of those costs a product page load that
+        the brand filter then throws away. The facet raised that to 47-100%
+        across the brands sampled, so far fewer pages are opened to find the
+        same products.
+        """
+        query = quote_plus(_text(brand))
+        refinement = quote(f"p_89:{_text(brand)}") if faceted else ""
         urls: list[str] = []
         for page_number in range(1, self.brand_search_page_limit + 1):
             url = (
                 "https://www.amazon.in/s?"
                 f"k={query}&i=beauty&page={page_number}"
             )
+            if refinement:
+                url = f"{url}&rh={refinement}"
             try:
                 page_urls = self._browse(url, self._discover_search_page)
             except Exception as exc:  # noqa: BLE001 - one brand must not stop the sweep
                 self.page_failures += 1
                 self.logger.error(
-                    "amazon_brand_search brand=%s page=%s failed=%s",
+                    "amazon_brand_search brand=%s page=%s faceted=%s failed=%s",
                     brand,
                     page_number,
+                    faceted,
                     exc,
                 )
                 break
@@ -883,6 +943,29 @@ class AmazonClient:
             if not page_urls:
                 break
         return urls
+
+    def _brand_from_title(self, title: str) -> str:
+        """Recover a brand from the title when the page never names one.
+
+        An empty brand is not harmless. The sweep drops any product whose
+        brand is not in the configured filter, and a blank never matches, so a
+        page served in a layout the parser could not read was discarded even
+        when it was one of the brands being collected. Amazon titles on those
+        pages open with the brand, so matching the configured names against
+        the front of the title recovers it.
+
+        The longest match wins, so a configured "The Face Shop" is preferred
+        over a configured "The Face" when a title would satisfy both.
+        """
+        folded = brand_key(title)
+        if not folded:
+            return ""
+        best_name, best_length = "", 0
+        for name in self.brand_names:
+            key = brand_key(name)
+            if key and folded.startswith(key) and len(key) > best_length:
+                best_name, best_length = name, len(key)
+        return best_name
 
     @staticmethod
     def _attributes(page: Page) -> dict[str, str]:
@@ -967,9 +1050,18 @@ class AmazonClient:
         if not asin or not title:
             raise ValueError("Amazon product page has no ASIN or title.")
 
+        # Amazon serves product pages in more than one layout. Only some carry
+        # #bylineInfo; others put the brand in the product-overview table and
+        # nowhere else, so reading the byline alone left brand empty on a real
+        # share of pages - and an empty brand is dropped by the filter below.
         brand = self._first_text(
             page,
-            ("#bylineInfo", "#productOverview_feature_div tr:has-text('Brand') td"),
+            (
+                "#bylineInfo",
+                "tr.po-brand td.a-span9",
+                "#brand",
+                "#productOverview_feature_div tr.po-brand td:nth-child(2)",
+            ),
         )
         brand = re.sub(
             r"^(?:Visit the |Brand:\s*)| Store$",
@@ -977,6 +1069,12 @@ class AmazonClient:
             brand,
             flags=re.IGNORECASE,
         ).strip()
+        if brand.casefold() == "brand":
+            # The label cell rather than its value: worse than nothing,
+            # because it would be stored and filtered as a brand name.
+            brand = ""
+        if not brand:
+            brand = self._brand_from_title(title)
         selling_price = self._amazon_price(
             page,
             (
@@ -1086,20 +1184,24 @@ class AmazonClient:
                 "'inline-twister-dim-title-value-size_name']",
             ),
         )
-        key_features = [
-            value
-            for value in self._texts(page, "#feature-bullets li span")
-            if value.casefold() != "see more"
-        ]
-        description_parts = [
-            self._first_text(page, ("#productDescription",)),
-            *key_features,
-        ]
-        description = "\n".join(_unique(description_parts))
-        important = self._first_text(
-            page,
-            ("#importantInformation", "#important-information"),
-        )
+        key_features: list[str] = []
+        description = ""
+        important = ""
+        if self.collect_content:
+            key_features = [
+                value
+                for value in self._texts(page, "#feature-bullets li span")
+                if value.casefold() != "see more"
+            ]
+            description_parts = [
+                self._first_text(page, ("#productDescription",)),
+                *key_features,
+            ]
+            description = "\n".join(_unique(description_parts))
+            important = self._first_text(
+                page,
+                ("#importantInformation", "#important-information"),
+            )
         ingredients = _section(
             important,
             "Ingredients",
@@ -1177,18 +1279,21 @@ class AmazonClient:
             "#wayfinding-breadcrumbs_feature_div a",
         )
         html_parts: list[str] = []
-        for selector in (
-            "#productDescription",
-            "#aplus",
-            "#importantInformation",
-            "#important-information",
-        ):
-            locator = page.locator(selector)
-            try:
-                if locator.count():
-                    html_parts.append(locator.first.inner_html(timeout=2_000))
-            except Exception:
-                continue
+        if self.collect_content:
+            for selector in (
+                "#productDescription",
+                "#aplus",
+                "#importantInformation",
+                "#important-information",
+            ):
+                locator = page.locator(selector)
+                try:
+                    if locator.count():
+                        html_parts.append(
+                            locator.first.inner_html(timeout=2_000)
+                        )
+                except Exception:
+                    continue
 
         variant_asins: list[str] = []
         for selector in (
@@ -1291,7 +1396,7 @@ class AmazonClient:
             key_features=key_features,
             special_features=special_features,
             product_attributes=attributes,
-            top_reviews=self._reviews(page),
+            top_reviews=self._reviews(page) if self.collect_content else [],
             scraped_at=datetime.now(timezone.utc).isoformat(
                 timespec="microseconds"
             ),
