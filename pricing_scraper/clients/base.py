@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import shlex
 import threading
 import time
@@ -13,6 +14,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
+
+from html.parser import HTMLParser
 
 import requests
 
@@ -221,6 +224,23 @@ def build_logger(name: str, logs_dir: Path) -> logging.Logger:
     return logger
 
 
+
+def _decoded_body(response: requests.Response) -> str:
+    """Decode a page body, defaulting to UTF-8 rather than ISO-8859-1.
+
+    When a text/* response carries no charset, RFC 2616 says to assume
+    ISO-8859-1 and requests obeys it. Indian storefronts serve UTF-8 without
+    declaring it, so that default turns every non-ASCII character into
+    mojibake - a product name came back as "WishCareA Rosemary Essential OilA"
+    where the site shows a non-breaking space. The declared charset is still
+    honoured whenever the server actually sends one.
+    """
+    declared = "charset=" in response.headers.get("Content-Type", "").casefold()
+    if not declared:
+        return response.content.decode("utf-8", errors="replace")
+    return response.text
+
+
 class BaseJsonClient:
     """A rate-limited requests client with block detection and retries."""
 
@@ -298,13 +318,19 @@ class BaseJsonClient:
         return path
 
     @classmethod
-    def _soft_block_reason(cls, response: requests.Response) -> str:
+    def _soft_block_reason(
+        cls, response: requests.Response, *, expect_html: bool = False
+    ) -> str:
         sample = response.text[:10000].casefold()
         marker = next(
             (value for value in cls.SOFT_BLOCK_MARKERS if value in sample), ""
         )
         if marker:
             return f"body contains {marker!r}"
+        if expect_html:
+            # A page request wants HTML, so receiving it is the success case,
+            # not a block. Only the markers above mean anything here.
+            return ""
         content_type = response.headers.get("Content-Type", "").casefold()
         stripped = sample.lstrip()
         # Some retailer JSON APIs incorrectly respond with text/html. A body
@@ -327,6 +353,53 @@ class BaseJsonClient:
         headers: Mapping[str, str] | None = None,
     ) -> Any:
         """Request and decode JSON, retrying transient errors and soft blocks."""
+        return self._request(
+            method,
+            url,
+            parse=lambda response: response.json(),
+            parse_label="json_parse",
+            data=data,
+            json_body=json_body,
+            headers=headers,
+        )
+
+    def request_text(
+        self,
+        method: str,
+        url: str,
+        *,
+        data: str | bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> str:
+        """Request a page body, with the same pacing and block handling.
+
+        Not every storefront publishes a catalogue API. The ones that only
+        answer in HTML still need the rate limiting, retry, and soft-block
+        detection that the JSON path already implements, so both share one
+        request loop rather than growing a second copy of it.
+        """
+        return self._request(
+            method,
+            url,
+            parse=_decoded_body,
+            parse_label="text_read",
+            expect_html=True,
+            data=data,
+            headers=headers,
+        )
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        parse: Callable[[requests.Response], Any],
+        parse_label: str,
+        expect_html: bool = False,
+        data: str | bytes | None = None,
+        json_body: Any = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
         last_error = ""
         last_status_code: int | None = None
         last_response_text = ""
@@ -396,7 +469,9 @@ class BaseJsonClient:
                 )
                 break
 
-            soft_block = self._soft_block_reason(response)
+            soft_block = self._soft_block_reason(
+                response, expect_html=expect_html
+            )
             if soft_block:
                 self.blocks_encountered += 1
                 last_error = soft_block
@@ -414,10 +489,13 @@ class BaseJsonClient:
                 break
 
             try:
-                payload = response.json()
-            except (requests.JSONDecodeError, json.JSONDecodeError, ValueError) as exc:
-                last_error = f"JSON parse failed: {exc}"
-                path = self._dump_failure(response.text, "json_parse")
+                payload = parse(response)
+            except ValueError as exc:
+                # requests.JSONDecodeError and json.JSONDecodeError are both
+                # ValueError subclasses, so this still covers what the JSON
+                # path caught before the two request kinds were merged.
+                last_error = f"{parse_label} failed: {exc}"
+                path = self._dump_failure(response.text, parse_label)
                 self.logger.error(
                     "response url=%s status=%s bytes=%s parse=failure dump=%s",
                     response.url,
@@ -446,3 +524,110 @@ class BaseJsonClient:
             attempts=attempts_made,
             response_text=last_response_text,
         )
+
+
+class _TextExtractor(HTMLParser):
+    """Collect readable text from a markup fragment, dropping scripts."""
+
+    SKIP = {"script", "style", "noscript"}
+    BREAK_AFTER = {"p", "br", "li", "div", "h1", "h2", "h3", "h4", "h5", "h6", "tr"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._skipping = 0
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        if tag.casefold() in self.SKIP:
+            self._skipping += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.casefold()
+        if lowered in self.SKIP and self._skipping:
+            self._skipping -= 1
+        if lowered in self.BREAK_AFTER:
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if data and not self._skipping:
+            self._parts.append(data)
+
+    def text(self) -> str:
+        joined = "".join(self._parts)
+        lines = [line.strip() for line in joined.splitlines()]
+        return "\n".join(line for line in lines if line).strip()
+
+
+def html_to_text(markup: str) -> str:
+    """Flatten a description fragment into plain text.
+
+    Storefronts return descriptions as HTML. The catalogue stores a readable
+    string, and a malformed fragment must not end a run, so a parse failure
+    degrades to the markup with its tags stripped rather than raising.
+    """
+    if not markup:
+        return ""
+    parser = _TextExtractor()
+    try:
+        parser.feed(markup)
+        parser.close()
+    except Exception:  # noqa: BLE001 - a bad fragment is not worth a failed run
+        return re.sub(r"<[^>]+>", " ", markup).strip()
+    return parser.text()
+
+
+_LD_BLOCK = re.compile(
+    r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _is_product(node: Any) -> bool:
+    """Does this schema.org node describe a product?
+
+    The @type is written either bare ("Product") or as the full vocabulary URL
+    ("http://schema.org/Product") depending on the storefront, and may be a
+    list when a node claims several types at once.
+    """
+    if not isinstance(node, Mapping):
+        return False
+    declared = node.get("@type")
+    values = declared if isinstance(declared, list) else [declared]
+    return any(
+        str(value or "").rstrip("/").rsplit("/", 1)[-1].casefold() == "product"
+        for value in values
+    )
+
+
+def linked_product(markup: str) -> dict[str, Any]:
+    """Return the schema.org Product block from a page, or an empty mapping.
+
+    Structured data is the stable part of a storefront page: the markup around
+    it is redesigned freely, but this block is maintained because search
+    engines read it. Nodes can arrive bare, inside a list, or wrapped in an
+    @graph, so all three are searched.
+    """
+    for raw in _LD_BLOCK.findall(markup or ""):
+        try:
+            payload = json.loads(raw.strip())
+        except ValueError:
+            continue
+        queue = payload if isinstance(payload, list) else [payload]
+        while queue:
+            node = queue.pop(0)
+            if isinstance(node, Mapping) and isinstance(node.get("@graph"), list):
+                queue.extend(node["@graph"])
+            if _is_product(node):
+                return dict(node)
+    return {}
+
+
+def first_offer(node: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a product's offer, whether it is given singly or as a list."""
+    offers = node.get("offers")
+    if isinstance(offers, list):
+        for offer in offers:
+            if isinstance(offer, Mapping):
+                return dict(offer)
+        return {}
+    return dict(offers) if isinstance(offers, Mapping) else {}

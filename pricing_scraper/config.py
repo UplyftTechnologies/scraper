@@ -83,6 +83,10 @@ def load_config(path: Path, _seen: set[Path] | None = None) -> dict[str, Any]:
 
     payload.setdefault("tira", {})
     payload.setdefault("amazon", {})
+    # The storefront clients read only optional overrides - a base URL, a user
+    # agent - so an absent section is a complete configuration, not an error.
+    for optional_site in ("purplle", "kindlife", "broadway"):
+        payload.setdefault(optional_site, {})
     for site in ("nykaa", "tira"):
         curl_file = str(payload[site].get("curl_file") or "").strip()
         if curl_file:

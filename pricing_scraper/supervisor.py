@@ -40,10 +40,25 @@ from pricing_scraper.models import Product, brand_key
 
 LOGGER = logging.getLogger("pricing_scraper.supervisor")
 
-SITES = ("nykaa", "tira", "amazon")
-# Where a barcode is trusted from, best first. Nykaa publishes one per SKU;
-# Amazon's is inferred from the model-number row, so it is the last resort.
-DONOR_ORDER = ("nykaa", "tira", "amazon", "manual")
+SITES = ("nykaa", "tira", "amazon", "purplle", "kindlife", "broadway")
+# Where a barcode is trusted from, best first.
+#
+# Broadway leads because its Shopify catalogue states the barcode outright and
+# carried one for every product of the tracked brands but a single one, whose
+# check digit the vendor itself had wrong. Nykaa publishes one per SKU. Purplle
+# and Kindlife are lower because their barcodes are recovered rather than
+# declared - from an identifier that is sometimes an internal code, and from
+# photograph filenames. Amazon is last: its barcode is inferred from the
+# model-number row, which is the weakest source of all.
+DONOR_ORDER = (
+    "broadway",
+    "nykaa",
+    "tira",
+    "purplle",
+    "kindlife",
+    "amazon",
+    "manual",
+)
 DEFAULT_THRESHOLD = 0.90
 
 

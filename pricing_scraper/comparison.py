@@ -26,9 +26,12 @@ from pricing_scraper.models import Product, brand_key, normalize_gtin
 LOGGER = logging.getLogger(__name__)
 
 ROOPSEE_SITE = "roopsee"
-# Own catalogue first: it anchors the comparison. Nykaa follows because its
-# rows carry barcodes, which give the strongest matches.
-ANCHOR_ORDER = (ROOPSEE_SITE, "nykaa", "tira", "amazon")
+RETAILER_SITES = ("nykaa", "tira", "amazon", "purplle", "kindlife", "broadway")
+# Own catalogue first: it anchors the comparison. The retailers follow in
+# order of how well their rows match, which is largely how reliably they carry
+# a barcode: Broadway states one outright, Nykaa publishes one per SKU, and
+# Amazon's has to be inferred.
+ANCHOR_ORDER = (ROOPSEE_SITE, "broadway", "nykaa", "tira", "purplle", "amazon")
 
 # Words that carry no distinguishing meaning in a beauty product title.
 STOP_WORDS = frozenset(
@@ -608,7 +611,7 @@ def load_retailer_products(
     *,
     csv_path: Path | None = None,
     use_database: bool = True,
-    sites: Sequence[str] = ("nykaa", "tira", "amazon"),
+    sites: Sequence[str] = RETAILER_SITES,
 ) -> list[Product]:
     """Read scraped retailer rows from Supabase, falling back to the CSV export."""
     if use_database:

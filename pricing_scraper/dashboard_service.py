@@ -1258,3 +1258,98 @@ def collect_amazon(
             listing_products=run.discovered_asins,
             detail_parents=len(detail_store.load_processed_ids()),
         )
+
+
+# The three plain-HTTP storefronts differ only in which client reads them:
+# each discovers its own catalogue in one request and returns finished
+# products, so they need none of the category and checkpoint machinery the
+# older retailers do.
+STOREFRONT_CLIENTS: dict[str, str] = {
+    "purplle": "PurplleClient",
+    "kindlife": "KindlifeClient",
+    "broadway": "BroadwayClient",
+}
+
+
+def collect_storefront(
+    site: str,
+    config: dict[str, Any],
+    *,
+    output_path: str | Path | None = None,
+    sample_limit: int = 0,
+    progress_callback: ProgressCallback | None = None,
+) -> CollectionResult:
+    """Collect one storefront, then export and synchronize exactly as the
+    established retailers do.
+
+    Products stream into the database sink as they are read, so a run that
+    fails part way keeps what it collected, and the export at the end
+    reconciles the whole catalogue.
+    """
+    import importlib
+
+    if site not in STOREFRONT_CLIENTS:
+        raise ValueError(f"{site!r} is not a storefront client.")
+    module = importlib.import_module(f"pricing_scraper.clients.{site}")
+    client_class = getattr(module, STOREFRONT_CLIENTS[site])
+
+    run_config = copy.deepcopy(config)
+    sink, _run_id = _open_run_sink(site, run_config)
+    seen = 0
+
+    def on_product(product: Product) -> None:
+        nonlocal seen
+        seen += 1
+        if sink is not None:
+            sink.add([product])
+        if progress_callback is not None:
+            # The reporter takes positional arguments. Passing a mapping raised
+            # a TypeError inside the per-product handler, which counted every
+            # product as a failure and skipped the sample limit with it.
+            progress_callback("products", seen, 0, f"{seen:,} products")
+
+    client = client_class(
+        run_config.get(site) or {},
+        run_config["request"],
+        brands=run_config.get("brands") or [],
+    )
+    completed = True
+    try:
+        with client:
+            products = client.collect(
+                on_product=on_product, max_products=sample_limit
+            )
+    except Exception:
+        # The sink already holds whatever was read, and the run is reported
+        # incomplete so nothing ages products it never got to.
+        completed = False
+        _close_sink(sink, complete_sweep=False)
+        raise
+
+    excel_path, csv_path = _output_paths(run_config, output_path)
+    combined = merge_with_existing_sites(products, csv_path, replacing_site=site)
+    # A sample is a smoke test, not a sweep, so it must never be treated as a
+    # complete view of the catalogue: doing so would age every product it
+    # skipped towards inactive.
+    complete_sweep = completed and not sample_limit
+    _close_sink(sink, complete_sweep=complete_sweep)
+    export = export_products(
+        combined,
+        excel_path,
+        csv_path,
+        sync_database=_needs_final_sync(run_config, sink, len(combined)),
+        write_excel=_write_excel_here(),
+        status_callback=_export_status_callback(progress_callback),
+    )
+    return CollectionResult(
+        products=products,
+        export=export,
+        failures=client.failures + getattr(client, "product_failures", 0),
+        blocks=client.blocks_encountered,
+        requests=client.requests_made,
+        completed=complete_sweep,
+        next_page=None,
+        stop_reasons=(),
+        listing_products=len(products),
+        detail_parents=0,
+    )

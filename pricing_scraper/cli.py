@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from functools import partial
 import logging
 import time
 from pathlib import Path
@@ -34,7 +35,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--site",
         default="nykaa",
-        choices=("nykaa", "tira", "amazon", "all"),
+        choices=(
+            "nykaa",
+            "tira",
+            "amazon",
+            "purplle",
+            "kindlife",
+            "broadway",
+            "all",
+        ),
         help="Retailer to scrape.",
     )
     parser.add_argument(
@@ -455,6 +464,50 @@ def run_amazon(args: argparse.Namespace, config: dict[str, Any]) -> int:
     return 0
 
 
+STOREFRONTS = ("purplle", "kindlife", "broadway")
+
+
+def run_storefront(
+    site: str, args: argparse.Namespace, config: dict[str, Any]
+) -> int:
+    """Scrape one of the plain-HTTP storefronts."""
+    from pricing_scraper.dashboard_service import collect_storefront
+
+    reporter = ProgressReporter(site, position=args.position)
+    result = collect_storefront(
+        site,
+        config,
+        output_path=args.output,
+        sample_limit=args.sample,
+        progress_callback=reporter,
+    )
+    preview_limit = max(0, args.preview_limit)
+    if preview_limit:
+        print(
+            json.dumps(
+                [item.to_dict() for item in result.products[:preview_limit]],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    with_gtin = sum(1 for item in result.products if item.gtin)
+    print(f"\n{site} finished in {reporter.done()}")
+    print(
+        f"  {len(result.products):,} products, {with_gtin:,} with a barcode"
+    )
+    _print_summary(
+        result=result.export,
+        failures=result.failures,
+        blocks=result.blocks,
+        requests=result.requests,
+        database_configured=bool(
+            isinstance(config.get("database"), dict)
+            and config["database"].get("enabled", False)
+        ),
+    )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse CLI arguments and run the selected scraper."""
     parser = build_parser()
@@ -473,8 +526,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_tira(args, config)
         if args.site == "amazon":
             return run_amazon(args, config)
+        if args.site in STOREFRONTS:
+            return run_storefront(args.site, args, config)
         started = time.monotonic()
-        runners = (("nykaa", run_nykaa), ("tira", run_tira), ("amazon", run_amazon))
+        runners: tuple[tuple[str, Any], ...] = (
+            ("nykaa", run_nykaa),
+            ("tira", run_tira),
+            ("amazon", run_amazon),
+            *(
+                (site, partial(run_storefront, site))
+                for site in STOREFRONTS
+            ),
+        )
         for index, (site, runner) in enumerate(runners, start=1):
             args.position = f"{index}/{len(runners)}"
             print(f"\n=== {site} ({args.position}) ===", flush=True)

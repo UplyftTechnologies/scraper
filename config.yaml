@@ -198,6 +198,17 @@ tira:
         - hyaluronic
         - biotin
 
+# Storefronts reached over plain HTTP. Each reads only these optional
+# overrides; the defaults in the client are the live site.
+purplle:
+  base_url: https://www.purplle.com
+
+kindlife:
+  base_url: https://www.kindlife.in
+
+broadway:
+  base_url: https://shop.broadwaylive.in
+
 amazon:
   headless: true
   browser_channel: chrome
@@ -225,6 +236,14 @@ amazon:
   warmup_wait_ms: 8000
   delay_min_seconds: 2.0
   delay_max_seconds: 5.0
+  # Amazon product pages are mostly imagery, and none of those bytes are
+  # parsed - the image URLs come from the markup, which arrives either way.
+  # Measured over 14 live pages: 6.67s each before, 4.13s with this on.
+  block_assets: true
+  # Skip the descriptive copy - feature bullets, product description, the
+  # important-information panel and the reviews. Prices, barcodes, ratings,
+  # stock, images and the attribute table are all still collected.
+  collect_content: false
   checkpoint_dir: data/checkpoints
   max_retries: 2
   products: []

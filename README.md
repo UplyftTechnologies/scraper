@@ -200,7 +200,12 @@ the migrations before the next run.
 
 ## Nightly incremental automation
 
-Amazon remains manual. Nykaa and Tira have independent database-backed jobs:
+Amazon remains manual - the hosted image installs no browser. Everything else
+runs in the night: Nykaa and Tira through the incremental jobs below, and the
+Purplle, Kindlife and Broadway storefronts, which need no browser and so are
+collected straight into the database.
+
+Nykaa and Tira have independent database-backed jobs:
 
 ```powershell
 python -m pricing_scraper.scheduler --site nykaa
@@ -509,9 +514,28 @@ python main.py --site nykaa --all-categories
 python main.py --site tira --category Moisturizers
 python main.py --site amazon --category "Sun Care"
 python main.py --site amazon --all-categories
+python main.py --site purplle
+python main.py --site kindlife
+python main.py --site broadway
 python main.py --site all --category Moisturizers
 python main.py --site all --output data\pricing_all.xlsx
 ```
+
+Purplle, Kindlife, and Broadway are plain-HTTP storefronts. Each finds its own
+catalogue - Broadway through the Shopify `products.json`, the other two through
+their sitemaps - so they take neither `--category` nor `--all-categories`, and
+they resume by simply being run again rather than from a checkpoint.
+
+How reliably each publishes a barcode, measured against the configured brands:
+
+| Site | Products found | Carries a GTIN | Where the barcode comes from |
+| --- | --- | --- | --- |
+| Broadway | 522 across 36 brands | 521 (100%) | the Shopify variant barcode, stated outright |
+| Purplle | 2,861 across 61 brands | roughly 60% | `master_product_id`, or the EAN inside the sku |
+| Kindlife | 6,872 pages, a minority on-brand | roughly 25% | only where a product photo is named after it |
+
+Broadway is therefore the strongest donor for `build_gtin_supervisor.py`, and
+Kindlife is best treated as a price source that occasionally supplies one.
 
 To split a PowerShell command across lines, end each continued line with a
 backtick:
